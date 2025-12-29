@@ -48,7 +48,7 @@ graph TD
 
 ### 1. Cloner le projet
 
-git clone [https://github.com/votre-username/alpha-pead-titan.git](https://github.com/votre-username/alpha-pead-titan.git)
+git clone [https://github.com/K4g4y4k1/Titan-project.git](https://github.com/K4g4y4k1/Titan-project.git)
 cd alpha-pead-titan
 
 
