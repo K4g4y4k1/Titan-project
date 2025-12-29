@@ -1,0 +1,18 @@
+# 1. Ajoutez le fichier .gitignore à votre dossier s'il n'existe pas
+
+# 2. Dites à Git de supprimer de son index (mais pas de votre disque) 
+# tous les fichiers qui devraient être ignorés
+git rm -r --cached .
+
+# 3. Ajoutez à nouveau tous les fichiers
+# Git va maintenant appliquer les règles du .gitignore
+git add .
+
+# 4. Validez les changements
+git commit -m "Fix: Ajout du .gitignore et retrait des fichiers sensibles"
+
+# 5. Envoyez sur GitHub
+git push origin main
+
+echo "✅ Git a arrêté de suivre les fichiers sensibles."
+echo "⚠️ SI VOS CLÉS ÉTAIENT DÉJÀ EN LIGNE : Changez-les maintenant sur Alpaca/OpenRouter !"
