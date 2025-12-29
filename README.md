@@ -49,6 +49,7 @@ graph TD
 ### 1. Cloner le projet
 
 git clone [https://github.com/K4g4y4k1/Titan-project.git](https://github.com/K4g4y4k1/Titan-project.git)
+
 cd alpha-pead-titan
 
 
@@ -57,10 +58,15 @@ cd alpha-pead-titan
 Créez un fichier .env à la racine ou utilisez les secrets de votre plateforme :
 
 ALPACA_API_KEY=votre_cle
+
 ALPACA_SECRET_KEY=votre_secret
+
 FMP_API_KEY=votre_cle
+
 OPENROUTER_API_KEY=votre_cle
+
 TELEGRAM_BOT_TOKEN=ton_token
+
 TELEGRAM_CHAT_ID=ton_id
 
 
