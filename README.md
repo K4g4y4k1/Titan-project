@@ -1,8 +1,8 @@
-🛡️ Alpha-PEAD Titan v3.7 (Industrial Edition)
+# 🛡️ Alpha-PEAD Titan v3.7 (Industrial Edition)
 
 Alpha-PEAD Titan est un système de trading quantitatif autonome conçu pour exploiter la dérive post-annonce de résultats (Post-Earnings Announcement Drift). Le système combine l'analyse de données fondamentales en temps réel, le filtrage par Intelligence Artificielle et une gestion du risque de niveau institutionnel.
 
-🎯 Vision & Stratégie
+## 🎯 Vision & Stratégie
 
 Le bot repose sur la capture d'alpha lors des annonces de résultats d'entreprises US :
 
@@ -14,7 +14,7 @@ IA Sentinel : Validation qualitative via LLM (GPT-4o/Claude 3.5) pour analyser l
 
 Guardian Mode : Gestion automatisée des sorties (Stop-Loss et Take-Profit dynamiques).
 
-🛠️ Stack Technique
+## 🛠️ Stack Technique
 
 Langage : Python 3.11+
 
@@ -34,7 +34,7 @@ OpenRouter : Accès multi-modèles IA
 
 Telegram : Alertes push et monitoring distant
 
-🏗️ Architecture du Système
+## 🏗️ Architecture du Système
 
 graph TD
     A[Scanner FMP] -->|Triple Beat| B(IA Sentinel)
@@ -44,15 +44,15 @@ graph TD
     E -->|Notification| F[Telegram Bot]
 
 
-🚀 Installation & Déploiement
+## 🚀 Installation & Déploiement
 
-1. Cloner le projet
+### 1. Cloner le projet
 
 git clone [https://github.com/votre-username/alpha-pead-titan.git](https://github.com/votre-username/alpha-pead-titan.git)
 cd alpha-pead-titan
 
 
-2. Configuration des Secrets
+### 2. Configuration des Secrets
 
 Créez un fichier .env à la racine ou utilisez les secrets de votre plateforme :
 
@@ -64,18 +64,18 @@ TELEGRAM_BOT_TOKEN=ton_token
 TELEGRAM_CHAT_ID=ton_id
 
 
-3. Installation des dépendances
+### 3. Installation des dépendances
 
 pip install -r requirements.txt
 
 
-4. Lancement
+### 4. Lancement
 
 # Pour le dashboard
 streamlit run app.py
 
 
-🛡️ Gestion du Risque (Industrial Features)
+## 🛡️ Gestion du Risque (Industrial Features)
 
 Fixed Risk Per Trade : Risque limité à 1% du capital total par position.
 
@@ -85,7 +85,7 @@ Bracket Orders : Chaque achat est accompagné simultanément d'un Stop-Loss et d
 
 Sector Capping : Limitation de l'exposition maximale par secteur d'activité (ex: max 25% Tech).
 
-📝 Licence
+## 📝 Licence
 
 Ce projet est sous licence MIT. Consultez le fichier LICENSE pour plus de détails.
 
