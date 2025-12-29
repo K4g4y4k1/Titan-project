@@ -1,4 +1,4 @@
-🛡️ Alpha-PEAD Titan v3.7 (Industrial Edition)
+#🛡️ Alpha-PEAD Titan v3.7 (Industrial Edition)
 
 Alpha-PEAD Titan est un système de trading quantitatif autonome conçu pour exploiter la dérive post-annonce de résultats (Post-Earnings Announcement Drift). Le système combine l'analyse de données fondamentales en temps réel, le filtrage par Intelligence Artificielle et une gestion du risque de niveau institutionnel.
 
