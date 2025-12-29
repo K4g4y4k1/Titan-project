@@ -1,0 +1,31 @@
+[Unit]
+Description=Titan-Core Trading Daemon v4.1
+# S'assure que le réseau est disponible avant de démarrer le bot
+After=network.target
+
+[Service]
+# L'utilisateur Linux qui exécutera le processus (souvent 'ubuntu' sur AWS)
+User=ubuntu
+WorkingDirectory=/home/ubuntu/titan-project
+# Chemin vers l'exécutable Python et le script principal
+ExecStart=/usr/bin/python3 /home/ubuntu/titan-project/trading_daemon.py
+
+# Stratégie de relance automatique en cas de crash
+Restart=always
+# Attend 30 secondes avant de redémarrer pour éviter le spam en cas d'erreur fatale
+RestartSec=30
+
+# Injection des variables d'environnement (Sécurité : évite les fichiers .env sur Git)
+Environment="ALPACA_API_KEY=votre_cle_ici"
+Environment="ALPACA_SECRET_KEY=votre_secret_ici"
+Environment="FMP_API_KEY=votre_cle_fmp_ici"
+Environment="OPENROUTER_API_KEY=votre_cle_ai_ici"
+# Assure que les logs Python sont envoyés directement dans le journal sans mise en mémoire tampon
+Environment="PYTHONUNBUFFERED=1"
+
+# Limite les privilèges pour la sécurité
+NoNewPrivileges=true
+
+[Install]
+# Permet au service de se lancer automatiquement au démarrage du serveur
+WantedBy=multi-user.target
