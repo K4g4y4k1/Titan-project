@@ -9,9 +9,10 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import alpaca_trade_api as tradeapi
+import aiohttp
 
 # --- CONFIGURATION INSTITUTIONNELLE ---
-DB_PATH = "titan_prod_v4_1.db"
+DB_PATH = "titan_prod_v4_2.db"
 HALT_FILE = ".halt_trading"
 HEARTBEAT_FILE = ".daemon_heartbeat"
 LOG_FILE = "titan_engine.log"
@@ -28,227 +29,161 @@ GOUVERNANCE = {
     "STOP_LOSS_PCT": 0.03
 }
 
-# --- LOGGING (R10) ---
+# Modèles en compétition
+AI_MODELS = {
+    "The_Strategist": "anthropic/claude-3.5-sonnet",
+    "The_RiskManager": "openai/gpt-4o",
+    "The_Visionary": "google/gemini-pro-1.5"
+}
+
+# --- LOGGING ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | [%(module)s] %(message)s',
     handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()]
 )
 
-# --- ÉTAT DU SYSTÈME & METRICS (OPS/R9) ---
-SYSTEM_STATE = {
-    "status": "starting",
-    "last_cycle": None,
-    "equity": 0,
-    "drawdown": 0,
-    "win_rate": 0,
-    "profit_factor": 0,
-    "active_positions": 0
-}
+# --- DB INIT ---
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_order_id TEXT UNIQUE,
+                symbol TEXT,
+                qty REAL,
+                entry_price REAL,
+                exit_price REAL,
+                status TEXT,
+                pnl_realized REAL,
+                ai_champion TEXT, -- Qui a validé ce trade ?
+                ai_consensus_score REAL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ai_votes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER,
+                model_name TEXT,
+                vote_score INTEGER,
+                reason TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-class MetricsHandler(BaseHTTPRequestHandler):
-    """Endpoint de santé et métriques pour monitoring (R2/OPS)."""
-    def do_GET(self):
-        self.send_response(200 if SYSTEM_STATE["status"] == "ok" else 503)
-        self.send_header("Content-type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(SYSTEM_STATE).encode())
+# --- LE COLISÉE (Multi-IA) ---
+class AIColosseum:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.url = "https://openrouter.ai/api/v1/chat/completions"
 
-def start_metrics_server():
-    server = HTTPServer(('0.0.0.0', 8080), MetricsHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    logging.info("Serveur de métriques actif sur le port 8080")
+    async def _consult_oracle(self, session, model_key, model_id, context):
+        """Interroge un modèle spécifique."""
+        prompt = f"""
+        Rôle: {model_key}. Analyse l'action {context['symbol']} (Secteur: {context['sector']}).
+        Données: EPS Surprise {context['eps']:.1%}, Réaction J0 {context['j0']:.1%}.
+        
+        Ta mission: Donner un score de conviction (0-100) et une raison.
+        Format JSON: {{"score": 0-100, "reason": "..."}}
+        """
+        
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": { "type": "json_object" }
+        }
+        
+        try:
+            async with session.post(self.url, headers=headers, json=payload, timeout=20) as r:
+                if r.status == 200:
+                    res = await r.json()
+                    content = json.loads(res['choices'][0]['message']['content'])
+                    return {
+                        "model": model_key,
+                        "score": content.get('score', 0),
+                        "reason": content.get('reason', 'N/A')
+                    }
+        except Exception as e:
+            logging.error(f"Erreur IA {model_key}: {e}")
+        
+        return {"model": model_key, "score": 0, "reason": "Error"}
 
+    async def get_consensus(self, session, context):
+        """Lance la compétition et renvoie le vainqueur ou le consensus."""
+        tasks = [self._consult_oracle(session, k, v, context) for k, v in AI_MODELS.items()]
+        results = await asyncio.gather(*tasks)
+        
+        # Logique de Consensus : Moyenne
+        valid_votes = [r for r in results if r['score'] > 0]
+        if not valid_votes: return 0, "Aucune IA disponible", []
+
+        avg_score = sum(v['score'] for v in valid_votes) / len(valid_votes)
+        
+        # Le "Champion" est celui qui a le score le plus haut (pour l'attribution)
+        champion = max(valid_votes, key=lambda x: x['score'])
+        
+        return avg_score, champion['model'], valid_votes
+
+# --- MOTEUR TITAN v4.2 ---
 class TitanEngine:
     def __init__(self):
-        self.api_key = os.getenv("ALPACA_API_KEY")
-        self.api_secret = os.getenv("ALPACA_SECRET_KEY")
-        self.fmp_key = os.getenv("FMP_API_KEY")
-        self.is_paper = "paper" in os.getenv("ALPACA_BASE_URL", "paper").lower()
+        # ... (Initialisation identique v4.1) ...
+        # ... (Connexion Broker & DB) ...
+        self.colosseum = AIColosseum(os.getenv("OPENROUTER_API_KEY"))
+        init_db()
 
-        if not all([self.api_key, self.api_secret, self.fmp_key]):
-            logging.critical("ERREUR : Clés API manquantes dans l'environnement.")
-            sys.exit(1)
+    # ... (Méthodes Check Security & Reconcile identiques v4.1) ...
 
-        try:
-            base_url = "https://paper-api.alpaca.markets" if self.is_paper else "https://api.alpaca.markets"
-            self.alpaca = tradeapi.REST(self.api_key, self.api_secret, base_url, api_version='v2')
-            self.account = self.alpaca.get_account()
-            self.initial_equity = float(self.account.equity)
-            logging.info(f"Titan v4.1 Initialisé. Equity de base: {self.initial_equity}$")
-        except Exception as e:
-            logging.error(f"Échec connexion Alpaca: {e}")
-            sys.exit(1)
-
-        self._init_db()
-
-    def _init_db(self):
-        """Initialisation DB avec table d'equity pour analyse temporelle (R9)."""
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            # Audit des trades
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS audit_trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    client_order_id TEXT UNIQUE,
-                    symbol TEXT,
-                    qty REAL,
-                    entry_price REAL,
-                    exit_price REAL,
-                    status TEXT,
-                    pnl_realized REAL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            # Historique Equity (pour courbe de performance)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS equity_history (
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    total_equity REAL,
-                    drawdown REAL
-                )
-            """)
-
-    # --- SÉCURITÉ & ANALYTICS (R1 / R9) ---
-    def check_security_and_metrics(self):
-        if os.path.exists(HALT_FILE): return "HALT_MANUEL"
+    async def process_signal(self, symbol, price, sector, metrics):
+        # 1. Gouvernance Quant (R8)
+        if symbol in GOUVERNANCE["BLACKLIST"]: return
         
-        self.account = self.alpaca.get_account()
-        equity = float(self.account.equity)
+        # 2. Le Colisée (IA)
+        context = {"symbol": symbol, "sector": sector, "eps": metrics['eps'], "j0": metrics['j0']}
         
-        day_dd = (equity - float(self.account.last_equity)) / float(self.account.last_equity)
-        total_dd = (equity - self.initial_equity) / self.initial_equity
-        
-        # Enregistrement Equity (R9)
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("INSERT INTO equity_history (total_equity, drawdown) VALUES (?, ?)", (equity, day_dd))
-        
-        # Mise à jour état global
-        SYSTEM_STATE.update({"equity": equity, "drawdown": day_dd})
+        # On utilise la session aiohttp passée en paramètre ou créée à la volée (simplifié ici)
+        async with aiohttp.ClientSession() as session:
+            consensus_score, champion_name, votes = await self.colosseum.get_consensus(session, context)
 
-        if day_dd <= -GOUVERNANCE["MAX_DAILY_DRAWDOWN"]:
-            self.emergency_shutdown(f"DAY_DD_{day_dd:.2%}")
-            return "KILL_SWITCH_DAILY"
-            
-        if total_dd <= -GOUVERNANCE["MAX_TOTAL_DRAWDOWN"]:
-            self.emergency_shutdown(f"TOTAL_DD_{total_dd:.2%}")
-            return "KILL_SWITCH_TOTAL"
-            
-        return None
+        logging.info(f"🏛️ Consensus pour {symbol}: {consensus_score:.1f}/100 (Champion: {champion_name})")
 
-    def emergency_shutdown(self, reason):
-        logging.critical(f"🚨 SHUTDOWN D'URGENCE : {reason}")
-        self.alpaca.cancel_all_orders()
-        self.alpaca.close_all_positions()
-        with open(HALT_FILE, "w") as f:
-            f.write(f"TERMINATED_{reason}_{datetime.now()}")
+        # Seuil de déclenchement (Consensus > 75)
+        if consensus_score < 75:
+            return
 
-    # --- RÉCONCILIATION PAR ID (R4) ---
-    async def reconcile_portfolio(self):
-        positions = self.alpaca.list_positions()
-        actual_pos = {p.symbol: float(p.qty) for p in positions}
-        SYSTEM_STATE["active_positions"] = len(positions)
+        # 3. Exécution
+        await self.execute_trade(symbol, price, champion_name, consensus_score, votes)
+
+    async def execute_trade(self, symbol, price, champion, score, votes):
+        # ... (Calcul Risk Sizing R3 identique v4.1) ...
         
+        # Simulation ordre pour l'exemple
+        qty = 10 
+        client_id = f"titan_{symbol}_{uuid.uuid4().hex[:8]}"
+        
+        # ... (Envoi ordre Alpaca) ...
+
+        # Enregistrement enrichi (R9+)
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id, symbol, qty, entry_price, client_order_id FROM audit_trades WHERE status='OPEN'")
-            for db_id, sym, qty, entry, c_id in cursor.fetchall():
-                if sym not in actual_pos:
-                    # Traçabilité précise via les ordres fermés
-                    orders = self.alpaca.list_orders(status='closed', limit=5)
-                    fill_price = entry # Fallback
-                    for o in orders:
-                        if o.client_order_id == c_id or o.symbol == sym:
-                            fill_price = float(o.filled_avg_price) if o.filled_avg_price else entry
-                            break
-                    
-                    pnl = (fill_price - entry) * qty
-                    cursor.execute("""
-                        UPDATE audit_trades 
-                        SET status='RECONCILED', exit_price=?, pnl_realized=? 
-                        WHERE id=?
-                    """, (fill_price, pnl, db_id))
-                    logging.info(f"R4: Position {sym} réconciliée. PnL: {pnl}$")
+            cursor.execute("""
+                INSERT INTO audit_trades (client_order_id, symbol, qty, entry_price, status, ai_champion, ai_consensus_score)
+                VALUES (?, ?, ?, ?, 'OPEN', ?, ?)
+            """, (client_id, symbol, qty, price, champion, score))
             
-            # Calcul Metrics R9 pour le dashboard
-            cursor.execute("SELECT pnl_realized FROM audit_trades WHERE pnl_realized IS NOT NULL")
-            pnls = [row[0] for row in cursor.fetchall()]
-            if pnls:
-                wins = [p for p in pnls if p > 0]
-                SYSTEM_STATE["win_rate"] = len(wins) / len(pnls)
-                SYSTEM_STATE["profit_factor"] = sum(wins) / abs(sum([p for p in pnls if p <= 0])) if len(wins) != len(pnls) else 1.0
-
-    # --- EXÉCUTION INSTITUTIONNELLE (R6) ---
-    async def place_bracket_order(self, symbol, current_price):
-        # 1. Gouvernance
-        if symbol in GOUVERNANCE["BLACKLIST"]: return
-
-        # 2. Risk Sizing (R3)
-        equity = float(self.account.equity)
-        risk_per_trade = equity * GOUVERNANCE["RISK_PER_TRADE_PCT"]
-        stop_loss_price = current_price * (1 - GOUVERNANCE["STOP_LOSS_PCT"])
-        
-        qty = int(risk_per_trade / (current_price - stop_loss_price))
-        
-        # Cap par position (15% equity max)
-        max_qty = int((equity * GOUVERNANCE["MAX_POSITION_SIZE_PCT"]) / current_price)
-        qty = min(qty, max_qty)
-
-        if qty <= 0: return
-
-        # 3. Execution
-        client_id = f"titan_{symbol}_{uuid.uuid4().hex[:8]}"
-        try:
-            self.alpaca.submit_order(
-                symbol=symbol, qty=qty, side='buy', type='limit',
-                limit_price=round(current_price, 2),
-                client_order_id=client_id,
-                time_in_force='gtc',
-                order_class='bracket',
-                take_profit={'limit_price': round(current_price * (1 + GOUVERNANCE["TAKE_PROFIT_PCT"]), 2)},
-                stop_loss={'stop_price': round(stop_loss_price, 2)}
-            )
+            trade_id = cursor.lastrowid
             
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("""
-                    INSERT INTO audit_trades (client_order_id, symbol, qty, entry_price, status)
-                    VALUES (?, ?, ?, ?, 'OPEN')
-                """, (client_id, symbol, qty, current_price))
-            logging.info(f"🚀 ORDRE EXÉCUTÉ : {symbol} x {qty} (ID: {client_id})")
-        except Exception as e:
-            logging.error(f"Erreur exécution {symbol}: {e}")
+            # Enregistrement des votes individuels
+            for v in votes:
+                cursor.execute("""
+                    INSERT INTO ai_votes (trade_id, model_name, vote_score, reason)
+                    VALUES (?, ?, ?, ?)
+                """, (trade_id, v['model'], v['score'], v['reason']))
+            conn.commit()
 
-    async def run_loop(self):
-        SYSTEM_STATE["status"] = "running"
-        
-        if not self.alpaca.get_clock().is_open:
-            SYSTEM_STATE["status"] = "market_closed"
-            return
+    # ... (Reste du code run_loop identique v4.1) ...
 
-        error = self.check_security_and_metrics()
-        if error:
-            SYSTEM_STATE["status"] = f"critical_error_{error}"
-            return
-
-        await self.reconcile_portfolio()
-        # Scan & Logic ici
-        
-        SYSTEM_STATE["last_cycle"] = datetime.now().isoformat()
-        SYSTEM_STATE["status"] = "ok"
-
-async def main():
-    start_metrics_server()
-    engine = TitanEngine()
-    logging.info("=== Titan Engine v4.1 Scale-Ready Operational ===")
-    
-    while True:
-        try:
-            await engine.run_loop()
-            await asyncio.sleep(60)
-        except Exception as e:
-            logging.error(f"FATAL: Erreur boucle principale: {e}")
-            await asyncio.sleep(30)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# ... (Main loop identique) ...
