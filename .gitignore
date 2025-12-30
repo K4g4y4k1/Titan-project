@@ -2,7 +2,7 @@
 
 # 2. Dites à Git de supprimer de son index (mais pas de votre disque) 
 # tous les fichiers qui devraient être ignorés
-git rm -r --cached .env, *.db, *.log, .halt_trading, __pycache__/
+git rm -r --cached .env secrets.toml .streamlit/secrets.toml *.db *.db-journal *.db-wal *.log .halt_trading .daemon_heartbeat venv/ .venv/ pycache/ .DS_Store
 
 # 3. Ajoutez à nouveau tous les fichiers
 # Git va maintenant appliquer les règles du .gitignore
