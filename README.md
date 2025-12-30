@@ -1,98 +1,51 @@
-# 🛡️ Alpha-PEAD Titan v3.7 (Industrial Edition)
+# 🛡️ Titan-Core v4.5 "Sentinel-Elite"
 
-Alpha-PEAD Titan est un système de trading quantitatif autonome conçu pour exploiter la dérive post-annonce de résultats (Post-Earnings Announcement Drift). Le système combine l'analyse de données fondamentales en temps réel, le filtrage par Intelligence Artificielle et une gestion du risque de niveau institutionnel.
+Titan-Core est un moteur de trading quantitatif de niveau institutionnel conçu pour l'exploitation de la dérive post-annonce de résultats (PEAD).
 
-## 🎯 Vision & Stratégie
+Cette version v4.5 Sentinel-Elite introduit des barrières de résilience adaptative pour protéger le capital dans toutes les conditions de marché.
 
-Le bot repose sur la capture d'alpha lors des annonces de résultats d'entreprises US :
+## 🚀 Innovations Majeures
 
-Triple Beat Detection : Identification des entreprises dépassant les attentes sur l'EPS, le Revenu et la Guidance.
+- Multi-LLM Consensus : Consultation simultanée de Claude 3.5, GPT-4o et Gemini 1.5 Pro.
 
-Filtrage Quantitatif : Analyse de la volatilité (ATR) et du volume relatif (RVOL).
+- AI Circuit Breaker : Rejet automatique des signaux si l'écart-type des votes IA dépasse le seuil de tolérance.
 
-IA Sentinel : Validation qualitative via LLM (GPT-4o/Claude 3.5) pour analyser le contexte sectoriel et éviter la sur-corrélation.
+- Adaptative SL/TP : Le Stop-Loss et le Take-Profit s'ajustent dynamiquement selon la conviction de l'IA.
 
-Guardian Mode : Gestion automatisée des sorties (Stop-Loss et Take-Profit dynamiques).
+- Temporal Cooldown : Suspension automatique du trading pendant 4h après une série de 3 pertes.
 
-## 🛠️ Stack Technique
+- Risk Scaling : Réduction automatique de 50% de l'exposition si le drawdown total atteint 5%.
 
-Langage : Python 3.11+
+## 📂 Structure du Projet
 
-Framework UI : Streamlit (Dashboard temps réel)
+- trading_daemon.py : Le moteur de production (Daemon).
 
-Infrastructure : AWS EC2 (ou Hugging Face Spaces pour le monitoring)
+- backtester.py : Le simulateur de précision (Digital Twin).
 
-Base de données : SQLite (Persistance des trades et logs d'IA)
+- requirements.txt : Liste des dépendances.
 
-APIs Tierces :
+- setup_aws.sh : Script d'installation pour serveur Ubuntu.
 
-Alpaca Markets : Exécution des ordres (Paper/Live)
+- titan-core.service : Configuration pour exécution 24/7 sur AWS.
 
-Financial Modeling Prep (FMP) : Données financières fondamentales
+## 🛠️ Déploiement Rapide
 
-OpenRouter : Accès multi-modèles IA
+- Clonez ce dépôt sur votre serveur.
 
-Telegram : Alertes push et monitoring distant
+- Lancez bash setup_aws.sh.
 
-## 🏗️ Architecture du Système
+- Configurez vos clés API dans titan-core.service.
 
-graph TD
-    A[Scanner FMP] -->|Triple Beat| B(IA Sentinel)
-    B -->|Score > 80| C{Risk Manager}
-    C -->|Calcul Position 1%| D[Alpaca Broker]
-    D -->|Ordre Bracket| E{Marché}
-    E -->|Notification| F[Telegram Bot]
+- Activez le service : sudo systemctl enable --now titan-core.
 
+## 🛡️ Gouvernance
 
-## 🚀 Installation & Déploiement
+Le système applique strictement les règles de gestion du risque :
 
-### 1. Cloner le projet
+- Risk per Trade : 1% du capital.
 
-git clone [https://github.com/K4g4y4k1/Titan-project.git](https://github.com/K4g4y4k1/Titan-project.git)
+- Max Drawdown : 2% jour / 10% total.
 
-cd alpha-pead-titan
+- Garde-fous : Heartbeat constant et fichier de verrouillage .halt_trading.
 
-
-### 2. Configuration des Secrets
-
-Créez un fichier .env à la racine ou utilisez les secrets de votre plateforme :
-
-ALPACA_API_KEY=votre_cle
-
-ALPACA_SECRET_KEY=votre_secret
-
-FMP_API_KEY=votre_cle
-
-OPENROUTER_API_KEY=votre_cle
-
-TELEGRAM_BOT_TOKEN=ton_token
-
-TELEGRAM_CHAT_ID=ton_id
-
-
-### 3. Installation des dépendances
-
-pip install -r requirements.txt
-
-
-### 4. Lancement
-
-# Pour le dashboard
-streamlit run app.py
-
-
-## 🛡️ Gestion du Risque (Industrial Features)
-
-Fixed Risk Per Trade : Risque limité à 1% du capital total par position.
-
-Daily Kill-Switch : Arrêt automatique si le drawdown journalier dépasse 2%.
-
-Bracket Orders : Chaque achat est accompagné simultanément d'un Stop-Loss et d'un Take-Profit envoyés au serveur du broker.
-
-Sector Capping : Limitation de l'exposition maximale par secteur d'activité (ex: max 25% Tech).
-
-## 📝 Licence
-
-Ce projet est sous licence MIT. Consultez le fichier LICENSE pour plus de détails.
-
-Avertissement : Le trading comporte des risques. Ce logiciel est fourni à des fins éducatives. L'auteur n'est pas responsable des pertes financières liées à l'utilisation de ce bot.
+## Avertissement : Ce logiciel est un outil de recherche financière. Le trading comporte des risques réels de perte de capital. Testez toujours en mode PAPER pendant au moins 30 jours avant d'envisager un passage en LIVE.
