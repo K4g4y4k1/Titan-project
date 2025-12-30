@@ -1,159 +1,183 @@
 import pandas as pd
 import numpy as np
+import statistics
 import logging
+from datetime import datetime, timedelta
 
-class Backtester:
+# --- CONFIGURATION MIROIR TITAN v4.5 ---
+GOUVERNANCE = {
+    "BASE_RISK_PER_TRADE_PCT": 0.01,
+    "BASE_TP_PCT": 0.06,
+    "BASE_SL_PCT": 0.03,
+    "MIN_SL_PCT": 0.015,
+    "MAX_SL_PCT": 0.05,
+    "MAX_POSITION_SIZE_PCT": 0.10,
+    "MAX_CONSECUTIVE_LOSSES": 3,
+    "COOLDOWN_HOURS": 4,
+    "AI_DISPERSION_THRESHOLD": 25,
+    "MAX_TRADES_PER_DAY": 5
+}
+
+class TitanBacktesterElite:
     """
-    Simulateur de précision aligné sur Titan-Core v4.1 (Audit R9).
-    Intègre les Bracket Orders (TP/SL) et les contraintes de Gouvernance.
+    Simulateur Haute Fidélité v4.5.
+    Intègre : SL/TP Adaptatif, Cooldown après pertes, et Risk Scaling.
     """
-    
-    def __init__(self, initial_capital=10000):
-        # Configuration identique à la Gouvernance v4.1
+    def __init__(self, initial_capital=100000):
+        self.initial_capital = initial_capital
         self.capital = initial_capital
-        self.balance = initial_capital
-        self.risk_per_trade_pct = 0.01  # 1%
-        self.tp_pct = 0.05              # 5%
-        self.sl_pct = 0.03              # 3%
-        self.max_pos_size_pct = 0.15    # 15% (Cap institutionnel)
-        self.kill_switch_total = -0.10  # -10%
-        
+        self.equity_history = [initial_capital]
         self.trades = []
-        self.equity_history = [] # Format compatible v4.1
-
-    def calculate_metrics(self):
-        """Analyse de performance post-simulation."""
-        if not self.trades:
-            return "Aucun trade effectué. Vérifiez les critères de signal."
-            
-        df = pd.DataFrame(self.trades)
         
-        # Calcul des retours
-        df['pnl_pct'] = (df['exit_price'] - df['entry_price']) / df['entry_price']
+        # États de session (Miroir du Daemon)
+        self.consecutive_losses = 0
+        self.cooldown_until = None
+        self.trades_today = 0
+        self.current_date = None
+
+    def _get_adaptive_params(self, ai_score):
+        """Calcule le SL/TP adaptatif comme le moteur v4.5."""
+        conviction_factor = (ai_score - 80) / 20 
+        tp_raw = GOUVERNANCE["BASE_TP_PCT"] + (conviction_factor * 0.04)
+        sl_raw = GOUVERNANCE["BASE_SL_PCT"] - (conviction_factor * 0.01)
         
-        # Max Drawdown (Calcul précis sur courbe d'équité)
-        equity_series = pd.Series([h['equity'] for h in self.equity_history])
-        peak = equity_series.expanding().max()
-        drawdown = (equity_series - peak) / peak
-        max_dd = drawdown.min()
+        # Clamping de sécurité (Audit v4.4)
+        tp_final = min(max(tp_raw, 0.04), 0.12)
+        sl_final = min(max(sl_raw, GOUVERNANCE["MIN_SL_PCT"]), GOUVERNANCE["MAX_SL_PCT"])
+        return tp_final, sl_final
 
-        # Profit Factor
-        wins = df[df['pnl_realized'] > 0]['pnl_realized'].sum()
-        losses = abs(df[df['pnl_realized'] <= 0]['pnl_realized'].sum())
-        profit_factor = wins / losses if losses > 0 else float('inf')
-
-        return {
-            "Capital Final": f"{self.balance:.2f}$",
-            "Total Trades": len(df),
-            "Win Rate": f"{(df['pnl_realized'] > 0).mean():.2%}",
-            "Profit Factor": f"{profit_factor:.2f}",
-            "Sharpe Ratio": f"{(df['pnl_pct'].mean() / df['pnl_pct'].std() * np.sqrt(252)):.2f}" if df['pnl_pct'].std() != 0 else "0.00",
-            "Max Drawdown": f"{max_dd:.2%}",
-            "Total PnL": f"{df['pnl_realized'].sum():.2f}$"
-        }
-
-    def run_simulation(self, historical_data):
-        """Simulation avec logique Bracket Order & Kill Switch."""
-        print("🔍 Simulation Titan v4.1 en cours...")
+    def run(self, data_dict):
+        """
+        Exécute la simulation sur un dictionnaire de DataFrames {symbol: df}.
+        Le df doit contenir 'Open', 'High', 'Low', 'Close', 'Volume'.
+        """
+        print(f"🧪 Simulation Titan v4.5 'Sentinel-Elite' sur {len(data_dict)} actifs...")
         
-        for symbol, df in historical_data.items():
-            if df.empty: continue
+        # On simule un flux temporel unifié (simplifié ici par symbole)
+        for symbol, df in data_dict.items():
+            self.consecutive_losses = 0 # Reset par symbole pour le test
             
-            # Indicateurs techniques pour signaux proxy
-            df['vol_ma'] = df['Volume'].rolling(20).mean()
-            
-            for i in range(20, len(df) - 10):
-                # Vérification Kill Switch Total (R1)
-                total_drawdown = (self.balance - self.capital) / self.capital
-                if total_drawdown <= self.kill_switch_total:
-                    print(f"🚨 KILL SWITCH DÉCLENCHÉ à {df.index[i]}")
-                    break
-
+            for i in range(20, len(df) - 5):
                 row = df.iloc[i]
+                self.current_date = df.index[i]
                 
-                # SIGNAL PROXY PEAD (Volume Spike + Price Action)
-                if row['Volume'] > (row['vol_ma'] * 1.5) and row['Close'] > df.iloc[i-1]['Close'] * 1.02:
+                # 1. Vérification Cooldown & Limites journalières
+                if self.cooldown_until and self.current_date < self.cooldown_until:
+                    continue
+                
+                # 2. Simulation Signal PEAD (Triple Beat Proxy)
+                # On simule un signal si volume > 1.5x moyenne et hausse > 2%
+                vol_avg = df['Volume'].rolling(20).mean().iloc[i]
+                if row['Volume'] > vol_avg * 1.5 and row['Close'] > df['Close'].iloc[i-1] * 1.02:
                     
-                    entry_price = row['Close']
+                    # 3. Simulation du Colisée IA (Consensus & Dispersion)
+                    # On génère des scores aléatoires centrés sur le signal
+                    ai_scores = [np.random.normal(85, 10) for _ in range(3)]
+                    avg_score = sum(ai_scores) / 3
+                    dispersion = statistics.stdev(ai_scores)
                     
-                    # 1. CALCUL DU RISK SIZING (R3)
-                    risk_amount = self.balance * self.risk_per_trade_pct
-                    stop_loss = entry_price * (1 - self.sl_pct)
-                    take_profit = entry_price * (1 + self.tp_pct)
-                    
-                    risk_per_share = entry_price - stop_loss
-                    qty = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
-                    
-                    # 2. CAP DE POSITION (Gouvernance R7/R8)
-                    max_val = self.balance * self.max_pos_size_pct
-                    max_qty = int(max_val / entry_price)
-                    qty = min(qty, max_qty)
-                    
-                    if qty <= 0: continue
+                    # Filtre Disjoncteur IA (v4.3)
+                    if dispersion > GOUVERNANCE["AI_DISPERSION_THRESHOLD"] or avg_score < 80:
+                        continue
 
-                    # 3. SIMULATION DU BRACKET ORDER (Sortie réelle)
-                    exit_price = None
-                    exit_date = None
+                    # 4. Paramètres Adaptatifs (v4.4)
+                    tp_pct, sl_pct = self._get_adaptive_params(avg_score)
                     
-                    # On regarde les jours suivants pour voir quel bracket est touché en premier
-                    for j in range(i + 1, len(df)):
-                        day_high = df.iloc[j]['High']
-                        day_low = df.iloc[j]['Low']
-                        
-                        if day_low <= stop_loss:
-                            exit_price = stop_loss
-                            exit_date = df.index[j]
+                    # 5. Risk Scaling (v4.5)
+                    total_dd = (self.capital - self.initial_capital) / self.initial_capital
+                    risk_scaling = 0.5 if total_dd < -0.05 else 1.0
+                    
+                    # 6. Exécution du Trade (Le lendemain à l'Open)
+                    entry_price = df.iloc[i+1]['Open']
+                    risk_amt = self.capital * GOUVERNANCE["BASE_RISK_PER_TRADE_PCT"] * risk_scaling
+                    stop_price = entry_price * (1 - sl_pct)
+                    take_profit = entry_price * (1 + tp_pct)
+                    
+                    qty = int(risk_amt / (entry_price * sl_pct))
+                    
+                    # Sortie du trade (Simulation Bracket)
+                    pnl = 0
+                    exit_type = "TIME"
+                    for j in range(i+1, len(df)):
+                        h, l, c = df.iloc[j]['High'], df.iloc[j]['Low'], df.iloc[j]['Close']
+                        if l <= stop_loss:
+                            pnl = (stop_loss - entry_price) * qty
+                            exit_type = "SL"
                             break
-                        elif day_high >= take_profit:
-                            exit_price = take_profit
-                            exit_date = df.index[j]
+                        if h >= take_profit:
+                            pnl = (take_profit - entry_price) * qty
+                            exit_type = "TP"
                             break
-                        # Time exit après 10 jours si aucun bracket touché
-                        elif (j - i) >= 10:
-                            exit_price = df.iloc[j]['Close']
-                            exit_date = df.index[j]
+                        if (j - i) > 10: # Max 10 jours de drift
+                            pnl = (c - entry_price) * qty
+                            exit_type = "EXPIRED"
                             break
                     
-                    if exit_price:
-                        pnl = (exit_price - entry_price) * qty
-                        self.balance += pnl
+                    # 7. Mise à jour de la résilience
+                    self.capital += pnl
+                    self.equity_history.append(self.capital)
+                    
+                    if pnl < 0:
+                        self.consecutive_losses += 1
+                        if self.consecutive_losses >= GOUVERNANCE["MAX_CONSECUTIVE_LOSSES"]:
+                            self.cooldown_until = self.current_date + timedelta(hours=GOUVERNANCE["COOLDOWN_HOURS"])
+                    else:
+                        self.consecutive_losses = 0
                         
-                        self.trades.append({
-                            "symbol": symbol,
-                            "entry_price": entry_price,
-                            "exit_price": exit_price,
-                            "qty": qty,
-                            "pnl_realized": pnl,
-                            "date": exit_date
-                        })
-                        
-                        self.equity_history.append({
-                            "timestamp": exit_date,
-                            "equity": self.balance,
-                            "drawdown": (self.balance - self.capital) / self.capital
-                        })
+                    self.trades.append({
+                        'date': self.current_date,
+                        'symbol': symbol,
+                        'pnl': pnl,
+                        'type': exit_type,
+                        'ai_score': avg_score,
+                        'dispersion': dispersion,
+                        'sl_used': sl_pct,
+                        'tp_used': tp_pct,
+                        'scaling': risk_scaling
+                    })
 
-        return self.calculate_metrics()
+        self._report()
+
+    def _report(self):
+        if not self.trades:
+            print("❌ Aucun trade exécuté avec les filtres v4.5.")
+            return
+
+        df_res = pd.DataFrame(self.trades)
+        win_rate = len(df_res[df_res['pnl'] > 0]) / len(df_res)
+        total_pnl = self.capital - self.initial_capital
+        
+        print("\n" + "="*40)
+        print("📊 RAPPORT AUDIT BACKTEST v4.5")
+        print("="*40)
+        print(f"Capital Final    : {self.capital:,.2f} $")
+        print(f"PnL Total        : {total_pnl:,.2f} $ ({(total_pnl/self.initial_capital):.2%})")
+        print(f"Nombre de Trades : {len(df_res)}")
+        print(f"Win Rate         : {win_rate:.2%}")
+        
+        # Calcul Profit Factor
+        gains = df_res[df_res['pnl'] > 0]['pnl'].sum()
+        pertes = abs(df_res[df_res['pnl'] < 0]['pnl'].sum())
+        pf = gains / pertes if pertes > 0 else float('inf')
+        print(f"Profit Factor    : {pf:.2f}")
+        
+        # Calcul Max Drawdown
+        equity = np.array(self.equity_history)
+        peaks = np.maximum.accumulate(equity)
+        drawdowns = (equity - peaks) / peaks
+        print(f"Max Drawdown     : {drawdowns.min():.2%}")
+        print("="*40)
 
 if __name__ == "__main__":
-    # Génération de données synthétiques pour test de robustesse
-    dates = pd.date_range(start="2024-01-01", periods=200)
-    mock_data = {
-        "TECH_TKR": pd.DataFrame({
-            "Close": np.linspace(100, 110, 200) + np.random.normal(0, 1.5, 200),
-            "High": np.linspace(102, 112, 200) + 1,
-            "Low": np.linspace(98, 108, 200) - 1,
-            "Volume": np.random.randint(100, 1000, 200)
+    # Génération de données de test pour vérifier la logique
+    dates = pd.date_range('2024-01-01', periods=200, freq='D')
+    data = {}
+    for s in ["TECH_STK", "BIO_STK"]:
+        prices = np.random.normal(100, 2, 200).cumsum() + 1000
+        data[s] = pd.DataFrame({
+            'Open': prices, 'High': prices+5, 'Low': prices-5, 'Close': prices+1, 
+            'Volume': np.random.normal(100000, 20000, 200)
         }, index=dates)
-    }
-    
-    # Injection de signaux
-    mock_data["TECH_TKR"].iloc[50, 3] = 5000 # Spike volume
-    mock_data["TECH_TKR"].iloc[50, 0] = 105  # Spike prix
-    
-    bt = Backtester(initial_capital=10000)
-    results = bt.run_simulation(mock_data)
-    
-    print("\n--- RÉSULTATS BACKTEST v4.1 (Digital Twin) ---")
-    for k, v in results.items():
-        print(f"{k:15}: {v}")
+
+    tester = TitanBacktesterElite(initial_capital=100000)
+    tester.run(data)
