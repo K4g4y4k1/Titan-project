@@ -1,7 +1,7 @@
 #!/bin/bash
-# Script d'installation automatique TITAN-CORE v4.5 sur Ubuntu 22.04 LTS
+# Installation Titan v4.9.6 sur Ubuntu Server
 
-echo "🚀 Déploiement Titan-Core v4.5 Sentinel-Elite..."
+echo "🚀 Début de l'installation Titan v4.9.6 (Vanguard)..."
 
 # 1. Mise à jour système
 sudo apt update && sudo apt upgrade -y
@@ -22,3 +22,6 @@ sudo mkdir -p /var/log/titan-core
 sudo chown -R $USER:$USER /var/log/titan-core
 
 echo "✅ Prêt pour configuration des clés API."
+
+
+
