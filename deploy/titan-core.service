@@ -1,23 +1,23 @@
 [Unit]
-Description=Titan-Core v4.5 Sentinel-Elite
+Description=Titan-Core v4.9.6 Sentinel-Vanguard
 After=network.target
 
 [Service]
 User=ubuntu
-WorkingDirectory=/home/ubuntu/Titan-project
-ExecStart=/home/ubuntu/Titan-project/venv/bin/python3 /home/ubuntu/Titan-project/trading_daemon.py
+WorkingDirectory=/home/ubuntu/titan-project
+ExecStart=/home/ubuntu/titan-project/venv/bin/python3 /home/ubuntu/titan-project/trading_daemon.py
 
+# Redémarrage automatique
 Restart=always
 RestartSec=30
 
-# INJECTION DES SECRETS (À remplir sur le serveur)
-Environment="ALPACA_API_KEY=votre_cle"
-Environment="ALPACA_SECRET_KEY=votre_secret"
-Environment="FMP_API_KEY=votre_cle_fmp"
-Environment="OPENROUTER_API_KEY=votre_cle_ai"
-Environment="ENV_MODE=PAPER"
-Environment="LIVE_AFFIRMATION=False"
-Environment="PYTHONUNBUFFERED=1"
+# Variables d'Environnement (À COMPLÉTER SUR LE SERVEUR)
+Environment=PYTHONUNBUFFERED=1
+Environment=ENV_MODE=PAPER
+Environment=LIVE_AFFIRMATION=False
+Environment=ALPACA_API_KEY=VOTRE_CLE
+Environment=ALPACA_SECRET_KEY=VOTRE_SECRET
+Environment=OPENROUTER_API_KEY=VOTRE_CLE
 
 [Install]
 WantedBy=multi-user.target
