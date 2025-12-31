@@ -1,23 +1,29 @@
 [Unit]
-Description=Titan-Core v4.9.6 Sentinel-Vanguard
+Description=Titan-Core v4.9.8 Sentinel-Vanguard
 After=network.target
 
 [Service]
+# On utilise l'utilisateur 'ubuntu' par défaut sur AWS
 User=ubuntu
 WorkingDirectory=/home/ubuntu/titan-project
-ExecStart=/home/ubuntu/titan-project/venv/bin/python3 /home/ubuntu/titan-project/trading_daemon.py
+ExecStart=/home/ubuntu/titan-project/venv/bin/python /home/ubuntu/titan-project/trading_daemon.py
 
-# Redémarrage automatique
+# Stratégie de redémarrage : on attend 30s pour laisser respirer les API
 Restart=always
 RestartSec=30
 
-# Variables d'Environnement (À COMPLÉTER SUR LE SERVEUR)
+# --- SECRETS & ENVIRONNEMENT ---
 Environment=PYTHONUNBUFFERED=1
 Environment=ENV_MODE=PAPER
 Environment=LIVE_AFFIRMATION=False
-Environment=ALPACA_API_KEY=VOTRE_CLE
-Environment=ALPACA_SECRET_KEY=VOTRE_SECRET
-Environment=OPENROUTER_API_KEY=VOTRE_CLE
+Environment=ALPACA_API_KEY=VOTRE_CLE_ICI
+Environment=ALPACA_SECRET_KEY=VOTRE_SECRET_ICI
+Environment=FMP_API_KEY=VOTRE_FMP_ICI
+Environment=OPENROUTER_API_KEY=VOTRE_OR_ICI
+
+# Sécurité système
+NoNewPrivileges=true
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target
