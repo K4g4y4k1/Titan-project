@@ -1,51 +1,39 @@
-# 🛡️ Titan-Core v4.5 "Sentinel-Elite"
+# 🛡️ Titan v4.9.6 "The Final Vanguard"
 
-Titan-Core est un moteur de trading quantitatif de niveau institutionnel conçu pour l'exploitation de la dérive post-annonce de résultats (PEAD).
+Ce dépôt contient le code source et les outils de déploiement pour le moteur de trading adaptatif Titan.
 
-Cette version v4.5 Sentinel-Elite introduit des barrières de résilience adaptative pour protéger le capital dans toutes les conditions de marché.
+## 🚀 Installation Rapide (AWS)
 
-## 🚀 Innovations Majeures
+### Clonage & Setup :
 
-- Multi-LLM Consensus : Consultation simultanée de Claude 3.5, GPT-4o et Gemini 1.5 Pro.
+- git clone <votre_repo_prive> ~/titan-project
+- cd ~/titan-project
+- bash setup_aws.sh
 
-- AI Circuit Breaker : Rejet automatique des signaux si l'écart-type des votes IA dépasse le seuil de tolérance.
 
-- Adaptative SL/TP : Le Stop-Loss et le Take-Profit s'ajustent dynamiquement selon la conviction de l'IA.
+### Configuration du Service :
+Éditez titan-core.service avec vos clés API réelles, puis :
 
-- Temporal Cooldown : Suspension automatique du trading pendant 4h après une série de 3 pertes.
+- sudo cp titan-core.service /etc/systemd/system/
+- sudo systemctl daemon-reload
+- sudo systemctl enable titan-core
+- sudo systemctl start titan-core
 
-- Risk Scaling : Réduction automatique de 50% de l'exposition si le drawdown total atteint 5%.
 
-## 📂 Structure du Projet
+### Surveillance :
 
-- trading_daemon.py : Le moteur de production (Daemon).
+- Logs : journalctl -u titan-core -f
 
-- backtester.py : Le simulateur de précision (Digital Twin).
+- Métriques : curl http://localhost:8080 (Ou via Dashboard IP)
 
-- requirements.txt : Liste des dépendances.
+## 🛡️ Disjoncteurs Actifs
 
-- setup_aws.sh : Script d'installation pour serveur Ubuntu.
+- Daily DD (2%) : Veto journalier automatique.
 
-- titan-core.service : Configuration pour exécution 24/7 sur AWS.
+- Total DD (10%) : Fermeture de toutes les positions et verrouillage matériel.
 
-## 🛠️ Déploiement Rapide
+- Capital Forge : Triage auto (Active / Degraded / Quarantine) basé sur l'espérance réelle.
 
-- Clonez ce dépôt sur votre serveur.
+- Auto-Promotion : L'Exploration est promue si elle bat l'Exploitation.
 
-- Lancez bash setup_aws.sh.
-
-- Configurez vos clés API dans titan-core.service.
-
-- Activez le service : sudo systemctl enable --now titan-core.
-
-## 🛡️ Gouvernance
-
-Le système applique strictement les règles de gestion du risque :
-
-- Risk per Trade : 1% du capital.
-
-- Max Drawdown : 2% jour / 10% total.
-
-- Garde-fous : Heartbeat constant et fichier de verrouillage .halt_trading.
-
-## Avertissement : Ce logiciel est un outil de recherche financière. Le trading comporte des risques réels de perte de capital. Testez toujours en mode PAPER pendant au moins 30 jours avant d'envisager un passage en LIVE.
+- Note : Le fichier .daemon_heartbeat permet de vérifier que la boucle de trading est vivante.
