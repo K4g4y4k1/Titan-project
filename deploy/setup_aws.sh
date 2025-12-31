@@ -26,7 +26,7 @@ pip install pandas==2.2.0 numpy==1.26.0 aiohttp==3.9.1 alpaca-trade-api python-d
 
 # Installation de Pandas-TA via branche dev pour compatibilité 3.12
 echo "⚙️ Installation de Pandas-TA (Branche Development)..."
-pip install https://github.com/twopirllc/pandas-ta/archive/refs/heads/development.zip
+pip install pandas-ta
 
 # 6. Finalisation
 echo "✅ Installation de l'environnement terminée avec succès."
