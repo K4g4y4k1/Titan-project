@@ -1,11 +1,10 @@
 import pandas as pd
 import numpy as np
-import statistics
 import logging
 from datetime import datetime, timedelta
 
-# --- CONFIGURATION MIROIR TITAN v4.9.8 ---
-# Ces paramètres sont synchronisés avec la gouvernance du daemon Vanguard-Sentinel
+# --- CONFIGURATION MIROIR TITAN v5.6 ---
+# Synchronisation stricte avec la gouvernance du daemon Vanguard-Apex
 GOUVERNANCE = {
     "INITIAL_CAPITAL": 100000,
     "MIN_TRADES_FOR_JUDGEMENT": 10,
@@ -13,113 +12,157 @@ GOUVERNANCE = {
     "QUARANTINE_THRESHOLD_USD": -15.0,
     "MAX_SECTOR_EXPOSURE_PCT": 0.25,
     "MAX_POSITION_SIZE_PCT": 0.10,
+    "MAX_HOLDING_DAYS": 3,              # Aligné v5.6
     "GLOBAL_CAPS": {
-        "EXPLOITATION": 0.80, # 80% du risque total max
-        "EXPLORATION": 0.20   # 20% du risque total max
+        "EXPLOITATION": 0.80,
+        "EXPLORATION": 0.20
     },
     "MODES": {
         "EXPLOITATION": { "BASE_RISK": 0.01 },
         "EXPLORATION": { "BASE_RISK": 0.0025 }
     },
     "BASE_TP_PCT": 0.06,
-    "BASE_SL_PCT": 0.03
+    "BASE_SL_PCT": 0.03,
+    "MAX_DAILY_DRAWDOWN_PCT": 0.02,
+    "MAX_TOTAL_DRAWDOWN_PCT": 0.10      # Aligné v5.6
 }
 
-class TitanBacktesterV51:
+class TitanBacktesterV56:
     """
-    Simulateur de performance adaptatif v5.1.
-    Reproduit le triage de la Capital Forge et la surveillance Sentinel.
+    Simulateur de Portefeuille Temporel v5.6.
+    Intègre le Time-Exit J+3 et le Kill-Switch de Drawdown Total.
     """
     def __init__(self):
         self.capital = GOUVERNANCE["INITIAL_CAPITAL"]
+        self.initial_equity = GOUVERNANCE["INITIAL_CAPITAL"]
         self.equity_history = [self.capital]
         self.trade_log = []
+        self.open_positions = [] # Liste de dictionnaires pour le suivi J+3
         self.forge_memory = {"EXPLOITATION": [], "EXPLORATION": []}
-        self.is_promoted = False
-        self.sector_exposure = {} # Suivi des secteurs pour le backtest
+        self.is_halted = False
 
     def get_forge_allocation(self, mode):
-        """Simulation du triage à 3 niveaux (Active / Degraded / Quarantine)."""
+        """Triage Capital Forge (3 niveaux)."""
         history = self.forge_memory[mode][-20:]
         if len(history) < GOUVERNANCE["MIN_TRADES_FOR_JUDGEMENT"]:
-            return 1.0 # Phase d'observation
+            return 1.0
         
         expectancy = sum(history) / len(history)
         if expectancy <= GOUVERNANCE["QUARANTINE_THRESHOLD_USD"]: return 0.0
         if expectancy <= GOUVERNANCE["DEGRADED_THRESHOLD_USD"]: return 0.5
         return 1.0
 
-    def run_simulation(self, data_dict):
+    def run_simulation(self, iterations=180):
         """
-        data_dict: { 'SYMBOL': { 'df': DataFrame, 'sector': 'Tech' } }
+        Simule 180 jours de trading (environ 6 mois).
         """
-        print(f"🧪 Simulation Vanguard-Sentinel v5.1")
+        print(f"🧪 Lancement Simulation Apex-Guardian v5.6")
+        print(f"Mode: Portfolio Management (J+{GOUVERNANCE['MAX_HOLDING_DAYS']} Exit)")
         
-        all_symbols = list(data_dict.keys())
-        
-        # Simulation sur 100 jours fictifs
-        for day in range(100):
-            # 1. Sélection de candidats aléatoires parmi l'univers (Triple Beat Simulation)
-            daily_candidates = np.random.choice(all_symbols, size=min(5, len(all_symbols)), replace=False)
+        for day in range(iterations):
+            if self.is_halted: break
+
+            # 1. Gestion des positions existantes (Time-Exit & Market Moves)
+            self._update_open_positions(day)
+
+            # 2. Vérification des Kill-Switches
+            if self._check_kill_switches():
+                print(f"🚨 JOUR {day}: KILL-SWITCH DÉCLENCHÉ. Arrêt de la simulation.")
+                break
+
+            # 3. Scanning & Entrées (Si marché calme)
+            self._scan_and_enter(day)
             
-            for symbol in daily_candidates:
-                sector = data_dict[symbol]['sector']
-                
-                # 2. Simulation IA & Mode selection
-                score_ia = np.random.normal(82, 10)
-                sigma_ia = np.random.uniform(10, 30)
-                
-                mode = "EXPLOITATION" if score_ia >= 85 and sigma_ia <= 20 else "EXPLORATION" if score_ia >= 72 and sigma_ia <= 35 else None
-                if not mode: continue
-
-                # 3. Vérification de la Forge & Gouvernance
-                allocation = self.get_forge_allocation(mode)
-                if allocation == 0: continue
-
-                # Cap Taille Position & Global Cap
-                cap = GOUVERNANCE["GLOBAL_CAPS"][mode]
-                if mode == "EXPLORATION" and self.is_promoted: cap = 0.40
-                
-                risk_pct = GOUVERNANCE["MODES"][mode]["BASE_RISK"] * allocation * cap
-                
-                # Sizing avec cap 10% (Sentinel R5)
-                risk_amt = self.capital * risk_pct
-                max_pos_size = self.capital * GOUVERNANCE["MAX_POSITION_SIZE_PCT"]
-                
-                # Simulation de gain/perte
-                win = np.random.random() < 0.54 # Edge PEAD
-                pnl = (risk_amt * 2) if win else -risk_amt # R:R 2:1
-                
-                # 4. Update
-                self.capital += pnl
-                self.equity_history.append(self.capital)
-                self.forge_memory[mode].append(pnl)
-                
-                self.trade_log.append({
-                    'day': day, 'symbol': symbol, 'mode': mode, 'pnl': pnl, 'win': win, 'equity': self.capital
-                })
-
-                # Check Promotion
-                self.update_promotion_status()
+            # 4. Enregistrement équité journalière
+            self.equity_history.append(self.capital)
 
         self._print_report()
 
-    def update_promotion_status(self):
-        exp_exploit = np.mean(self.forge_memory["EXPLOITATION"][-10:]) if len(self.forge_memory["EXPLOITATION"]) >= 10 else 0
-        exp_explore = np.mean(self.forge_memory["EXPLORATION"][-10:]) if len(self.forge_memory["EXPLORATION"]) >= 10 else 0
-        self.is_promoted = exp_explore > exp_exploit and exp_explore > 0
+    def _update_open_positions(self, current_day):
+        """Simule le passage du temps et les sorties TP/SL/Time-Exit."""
+        active_positions = []
+        for pos in self.open_positions:
+            # Simulation du mouvement de prix (Probabiliste)
+            # 55% de chance de dériver vers le haut pour PEAD
+            move = np.random.choice(['TP', 'SL', 'HOLD'], p=[0.25, 0.15, 0.60])
+            
+            age = current_day - pos['entry_day']
+            
+            if move == 'TP':
+                pnl = pos['risk_amt'] * (GOUVERNANCE["BASE_TP_PCT"] / GOUVERNANCE["BASE_SL_PCT"])
+                self._close_trade(pos, pnl, "TAKE_PROFIT", current_day)
+            elif move == 'SL':
+                pnl = -pos['risk_amt']
+                self._close_trade(pos, pnl, "STOP_LOSS", current_day)
+            elif age >= GOUVERNANCE["MAX_HOLDING_DAYS"]:
+                # Sortie temporelle (Time-Exit) - Aligné v5.6
+                pnl = pos['risk_amt'] * np.random.uniform(-0.5, 0.8) # PnL aléatoire réduit
+                self._close_trade(pos, pnl, "TIME_EXIT", current_day)
+            else:
+                active_positions.append(pos)
+        
+        self.open_positions = active_positions
+
+    def _scan_and_enter(self, current_day):
+        """Simule la détection Alpha Vantage + yfinance."""
+        # On limite à 2 nouveaux trades max par jour pour rester réaliste
+        for _ in range(np.random.randint(0, 3)):
+            mode = np.random.choice(["EXPLOITATION", "EXPLORATION"], p=[0.7, 0.3])
+            
+            # Calcul Allocation Forge
+            alloc = self.get_forge_allocation(mode)
+            if alloc == 0: continue
+
+            # Sizing v5.6
+            risk_pct = GOUVERNANCE["MODES"][mode]["BASE_RISK"] * alloc * GOUVERNANCE["GLOBAL_CAPS"][mode]
+            risk_amt = self.capital * risk_pct
+            
+            # Cap de sécurité 10%
+            max_risk_allowed = self.capital * GOUVERNANCE["MAX_POSITION_SIZE_PCT"]
+            risk_amt = min(risk_amt, max_risk_allowed)
+
+            if risk_amt > 0:
+                self.open_positions.append({
+                    'entry_day': current_day,
+                    'mode': mode,
+                    'risk_amt': risk_amt,
+                    'symbol': f"TICKER_{np.random.randint(100, 999)}"
+                })
+
+    def _close_trade(self, pos, pnl, reason, day):
+        self.capital += pnl
+        self.forge_memory[pos['mode']].append(pnl)
+        self.trade_log.append({
+            'day': day, 'symbol': pos['symbol'], 'mode': pos['mode'], 
+            'pnl': pnl, 'reason': reason, 'equity': self.capital
+        })
+
+    def _check_kill_switches(self):
+        # Total Drawdown check (10%)
+        total_dd = (self.capital - self.initial_equity) / self.initial_equity
+        if total_dd <= -GOUVERNANCE["MAX_TOTAL_DRAWDOWN_PCT"]:
+            self.is_halted = True
+            return True
+        return False
 
     def _print_report(self):
         df = pd.DataFrame(self.trade_log)
-        total_pnl = self.capital - GOUVERNANCE["INITIAL_CAPITAL"]
-        print(f"\n{'='*40}\n📊 RAPPORT TITAN v5.1\n{'='*40}")
+        if df.empty: return print("Aucun trade généré.")
+        
+        print(f"\n{'='*45}\n📊 RAPPORT VANGUARD-APEX v5.6\n{'='*45}")
         print(f"Capital Final      : ${self.capital:,.2f}")
-        print(f"PnL Net           : {((self.capital/GOUVERNANCE['INITIAL_CAPITAL'])-1)*100:.2f}%")
-        print(f"Win Rate          : {(df['win'].mean()*100):.2f}%")
+        print(f"PnL Net           : {((self.capital/self.initial_equity)-1)*100:.2f}%")
         print(f"Total Trades      : {len(df)}")
-        print(f"Statut Promotion  : {'🔥 PROMU' if self.is_promoted else 'Standard'}")
-        print(f"Forge Status (Exp): {self.forge_memory['EXPLOITATION'][-1:]}")
+        print(f"Exit Temporels    : {len(df[df['reason'] == 'TIME_EXIT'])}")
+        print(f"Win Rate          : {(len(df[df['pnl'] > 0]) / len(df) * 100):.2f}%")
+        
+        # Analyse par mode
+        for m in ["EXPLOITATION", "EXPLORATION"]:
+            m_df = df[df['mode'] == m]
+            if not m_df.empty:
+                print(f"--- Mode {m} ---")
+                print(f"  Trades : {len(m_df)} | PnL : ${m_df['pnl'].sum():,.2f}")
+        print(f"{'='*45}")
 
 if __name__ == "__main__":
-    mock_data = {f'STOCK_{i}': {'sector': 'Tech'} for i in range(20)}
-    TitanBacktesterV51().run_simulation(mock_data)
+    TitanBacktesterV56().run_simulation(180)
