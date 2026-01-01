@@ -1,39 +1,76 @@
-# 🛡️ Titan v4.9.6 "The Final Vanguard"
+# 🛡️ Titan v5.6 "Apex-Guardian"
 
-Ce dépôt contient le code source et les outils de déploiement pour le moteur de trading adaptatif Titan.
+Titan v5.6 est un moteur de trading algorithmique haute performance spécialisé dans la stratégie PEAD (Post-Earnings Announcement Drift). Cette version "Apex-Guardian" fusionne l'agressivité de la v4.9.8 avec la rigueur institutionnelle de la v5.3.
 
-## 🚀 Installation Rapide (AWS)
+## 🚀 Architecture Hybride "Full-Free"
 
-### Clonage & Setup :
+Pour garantir une indépendance totale vis-à-vis des abonnements payants (FMP), Titan v5.6 utilise un écosystème de données distribué :
 
-- git clone <votre_repo_prive> ~/titan-project
+- Signal (Earnings) : Alpha Vantage (Via calendrier CSV optimisé).
+
+- Gouvernance (Secteurs) : yfinance (Avec système de cache SQLite local).
+
+- Exécution (Prix & Ordres) : Alpaca Markets (Temps réel via API Broker).
+
+- Intelligence : OpenRouter (Consensus IA via Gemini 2.0 Flash).
+
+## 🛡️ Disjoncteurs & Gouvernance "Guardian"
+
+Le système est protégé par une triple ceinture de sécurité :
+
+- Kill-Switch de Drawdown :
+
+- Journalier (2%) : Liquidation totale et arrêt si l'équité chute de 2% sur la journée.
+
+- Total (10%) : Verrouillage matériel (fichier .halt_trading) si le capital baisse de 10% par rapport à l'ancre initiale.
+
+- Time-Exit (J+3) : Fermeture automatique des positions stagnantes après 3 jours de détention pour libérer le capital.
+
+- Capital Forge : Système de triage adaptatif qui place les stratégies en Quarantaine ou en mode Dégradé selon leur espérance mathématique réelle.
+
+- Veto Sectoriel : Limitation stricte à 25% d'exposition maximum par secteur d'activité.
+
+## 🛠️ Installation Rapide (AWS EC2)
+
+Préparation du serveur :
+
+- git clone <votre_repo> ~/titan-project
 - cd ~/titan-project
 - bash setup_aws.sh
 
 
-### Configuration du Service :
-Éditez titan-core.service avec vos clés API réelles, puis :
+Configuration des Secrets : Éditez le fichier de service /etc/systemd/system/titan-core.service avec vos clés :
 
-- sudo cp titan-core.service /etc/systemd/system/
+- ALPACA_API_KEY / ALPACA_SECRET_KEY
+
+- ALPHA_VANTAGE_KEY
+
+- OPENROUTER_API_KEY
+
+Lancement :
+
 - sudo systemctl daemon-reload
-- sudo systemctl enable titan-core
-- sudo systemctl start titan-core
+- sudo systemctl enable --now titan-core
 
 
-### Surveillance :
+## 📟 Monitoring & Audit
 
-- Logs : journalctl -u titan-core -f
+Le système expose ses métriques en temps réel sur le port 8080.
 
-- Métriques : curl http://localhost:8080 (Ou via Dashboard IP)
+- Dashboard Live : Accédez à http://<IP_AWS>:8080 (Assurez-vous que le port est ouvert dans votre Security Group AWS).
 
-## 🛡️ Disjoncteurs Actifs
+- Audit des logs : journalctl -u titan-core -f
 
-- Daily DD (2%) : Veto journalier automatique.
+- Preuve de vie : ls -l .daemon_heartbeat (Le fichier doit être mis à jour toutes les 60 secondes).
 
-- Total DD (10%) : Fermeture de toutes les positions et verrouillage matériel.
+## 📊 Structure des Fichiers
 
-- Capital Forge : Triage auto (Active / Degraded / Quarantine) basé sur l'espérance réelle.
+- trading_daemon.py : Moteur principal asynchrone.
 
-- Auto-Promotion : L'Exploration est promue si elle bat l'Exploitation.
+- backtester.py : Simulateur de portefeuille synchronisé avec la logique v5.6.
 
-- Note : Le fichier .daemon_heartbeat permet de vérifier que la boucle de trading est vivante.
+- titan_prod_v5.db : Base de données SQLite (Trades, Forge, Cache Sectoriel).
+
+- .halt_trading : Fichier de sécurité (créez-le pour arrêter le bot manuellement).
+
+Note de conformité : Ce logiciel est un outil d'assistance au trading. Le trading comporte des risques importants. Testez toujours en mode PAPER pendant au moins 15 jours avant toute utilisation en capital réel.
