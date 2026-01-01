@@ -20,6 +20,7 @@ Environment=ALPACA_API_KEY=VOTRE_CLE_ICI
 Environment=ALPACA_SECRET_KEY=VOTRE_SECRET_ICI
 Environment=FMP_API_KEY=VOTRE_FMP_ICI
 Environment=OPENROUTER_API_KEY=VOTRE_OR_ICI
+Environment=ALPHA_VANTAGE_KEY=VOTRE_CLE_AV
 
 # Sécurité système
 NoNewPrivileges=true
