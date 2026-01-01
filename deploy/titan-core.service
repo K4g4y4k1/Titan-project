@@ -1,5 +1,5 @@
 [Unit]
-Description=Titan-Core v4.9.8 Sentinel-Vanguard
+Description=Titan-Core v5.6 Apex-Guardian
 After=network.target
 
 [Service]
