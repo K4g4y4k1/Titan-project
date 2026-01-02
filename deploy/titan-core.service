@@ -1,5 +1,5 @@
 [Unit]
-Description=Titan-Core v5.6 Apex-Guardian
+Description=Titan-Core v5.6.5 APEX-ULTIMATE
 After=network.target
 
 [Service]
