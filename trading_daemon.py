@@ -28,7 +28,7 @@ HALT_FILE = ".halt_trading"
 HEARTBEAT_FILE = ".daemon_heartbeat"
 
 # Sécurité Dashboard
-DASHBOARD_TOKEN = os.getenv("TITAN_DASHBOARD_TOKEN", secrets.token_urlsafe(32))
+DASHBOARD_TOKEN = os.getenv("TITAN_DASHBOARD_TOKEN", "12345") # Token par défaut ou via env
 
 ENV_MODE = os.getenv("ENV_MODE", "PAPER")
 ALPACA_KEY = os.getenv("ALPACA_API_KEY")
@@ -68,6 +68,7 @@ SYSTEM_STATE = {
     "equity": 0.0,
     "engine_version": "5.6.5-ApexUltimate",
     "trades_today": 0,
+    "daily_pnl_usd": 0.0,
     "allocation": {"EXPLOITATION": 1.0, "EXPLORATION": 1.0},
     "health": {
         "db": "unknown", 
@@ -80,16 +81,15 @@ SYSTEM_STATE = {
         "EXPLOITATION": {"expectancy": 0.0, "trades": 0},
         "EXPLORATION": {"expectancy": 0.0, "trades": 0}
     },
-    "auth_hint": DASHBOARD_TOKEN[:8] + "..."
+    "last_trade": None,
+    "auth_hint": DASHBOARD_TOKEN[:4] + "..."
 }
 
-# --- OBSERVABILITÉ AVANCÉE (Logging Rotatif JSON) ---
+# --- OBSERVABILITÉ ---
 class StructuredLogger:
     def __init__(self):
         self.logger = logging.getLogger("TitanUltimate")
         self.logger.setLevel(logging.INFO)
-        
-        # Handler rotatif : 5 fichiers de 10MB chacun
         handler = logging.handlers.RotatingFileHandler(
             LOG_FILE, maxBytes=10*1024*1024, backupCount=5
         )
@@ -110,66 +110,41 @@ class StructuredLogger:
 
 SLOG = StructuredLogger()
 
-# --- RÉSILIENCE RÉSEAU (Retry Logic) ---
-async def fetch_with_retry(session, url, headers=None, json_data=None, method="GET", retries=3):
-    for i in range(retries):
-        try:
-            if method == "GET":
-                async with session.get(url, headers=headers, timeout=15) as resp:
-                    if resp.status == 200: return await resp.read()
-                    if resp.status == 429: await asyncio.sleep(2**i) # Rate limit backoff
-            else:
-                async with session.post(url, headers=headers, json=json_data, timeout=15) as resp:
-                    if resp.status == 200: return await resp.json()
-        except Exception as e:
-            if i == retries - 1: raise e
-            await asyncio.sleep(1 * (i + 1))
-    return None
-
-# --- MONITORING DE SANTÉ GRANULAIRE ---
+# --- MONITORING SANTÉ ---
 class HealthMonitor:
     def check_all(self, alpaca_api):
         checks = {"latency": True, "errors": True, "alpaca": True}
-        
-        # Latence
         if SYSTEM_STATE["health"]["last_cycle"]:
             latency = (datetime.now() - datetime.fromisoformat(SYSTEM_STATE["health"]["last_cycle"])).total_seconds()
             if latency > GOUVERNANCE["CYCLE_LATENCY_THRESHOLD"]: checks["latency"] = False
-            
-        # Erreurs
         if SYSTEM_STATE["health"]["consecutive_errors"] >= GOUVERNANCE["MAX_CONSECUTIVE_FAILURES"]:
             checks["errors"] = False
-            
-        # Alpaca Heartbeat
         try:
             alpaca_api.get_clock()
             SYSTEM_STATE["health"]["alpaca"] = "connected"
         except:
             checks["alpaca"] = False
             SYSTEM_STATE["health"]["alpaca"] = "error"
-            
         return checks
 
-# --- EXÉCUTION DÉFENSIVE (Slippage & Fill Tracking) ---
+# --- EXÉCUTION (LIMIT ORDERS) ---
 class OrderExecutor:
     def __init__(self, alpaca):
         self.alpaca = alpaca
 
     async def secure_submit(self, params):
         try:
+            params["type"] = "limit"
             order = self.alpaca.submit_order(**params)
-            SLOG.log("order_sent", symbol=params['symbol'], qty=params['qty'])
+            SLOG.log("order_sent", symbol=params['symbol'], qty=params['qty'], price=params['limit_price'])
             
-            await asyncio.sleep(3) # Attente pour exécution limit
+            await asyncio.sleep(3)
             check = self.alpaca.get_order(order.id)
             
             if check.status == 'rejected':
                 SLOG.log("order_rejected", level="error", symbol=params['symbol'], reason=getattr(check, 'rejection_reason', 'unknown'))
                 SYSTEM_STATE["health"]["consecutive_errors"] += 1
                 return False
-            
-            if check.status != 'filled':
-                SLOG.log("order_pending", level="warning", symbol=params['symbol'], status=check.status)
             
             SYSTEM_STATE["health"]["consecutive_errors"] = 0 
             return True
@@ -178,30 +153,52 @@ class OrderExecutor:
             SLOG.log("exec_exception", level="error", error=str(e))
             return False
 
-# --- SERVEUR DASHBOARD SÉCURISÉ (Rate-Limited) ---
+# --- SERVEUR MÉTRIQUES AVEC FIX CORS ROBUSTE ---
 class SecureMetricsHandler(BaseHTTPRequestHandler):
-    last_request_time = 0
-
     def log_message(self, format, *args): return
-    
+
+    def _set_cors_headers(self):
+        """Ajoute les headers nécessaires pour autoriser les navigateurs externes."""
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS, POST")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, Origin")
+        self.send_header("Access-Control-Max-Age", "86400") # Cache du preflight pour 24h
+
+    def do_OPTIONS(self):
+        """Répond aux requêtes de pré-vérification (Preflight) des navigateurs."""
+        self.send_response(204) # No Content, standard pour OPTIONS
+        self._set_cors_headers()
+        self.end_headers()
+
     def do_GET(self):
-        # Rate limit rudimentaire (1 req / 500ms)
-        now = time.time()
-        if now - SecureMetricsHandler.last_request_time < 0.5:
-            self.send_response(429); self.end_headers(); return
-        SecureMetricsHandler.last_request_time = now
+        # Autoriser le health check sans token pour le debug
+        if self.path == '/health':
+            self.send_response(200)
+            self._set_cors_headers()
+            self.end_headers()
+            self.wfile.write(b"OK")
+            return
 
         auth = self.headers.get('Authorization', "")
+        
+        # Vérification du Token
         if not hmac.compare_digest(auth, f"Bearer {DASHBOARD_TOKEN}"):
-            self.send_response(401); self.end_headers(); return
+            self.send_response(401)
+            self._set_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Unauthorized"}).encode())
+            return
             
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._set_cors_headers()
         self.end_headers()
+        
+        # Envoi des métriques
         self.wfile.write(json.dumps({"metrics": SYSTEM_STATE}).encode())
 
-# --- MOTEUR TITAN APEX-ULTIMATE ---
+# --- MOTEUR TITAN APEX ---
 class TitanEngine:
     def __init__(self):
         self._validate_env()
@@ -215,29 +212,25 @@ class TitanEngine:
         self.initial_equity = self._load_anchor()
         self.av_cache = None
         self.last_av_fetch = None
-        self._backup_db()
 
     def _validate_env(self):
-        needed = {"ALPACA_KEY": ALPACA_KEY, "ALPACA_SECRET": ALPACA_SECRET, "AV_KEY": AV_KEY}
+        needed = {"ALPACA_KEY": ALPACA_KEY, "AV_KEY": AV_KEY}
         missing = [k for k, v in needed.items() if not v]
         if missing:
-            SLOG.log("critical_init_error", level="critical", missing=missing)
+            SLOG.log("startup_failed", level="critical", missing=missing)
             sys.exit(1)
 
     def _init_db(self):
-        try:
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("""CREATE TABLE IF NOT EXISTS trades (
-                    id INTEGER PRIMARY KEY, client_id TEXT UNIQUE, symbol TEXT, 
-                    qty REAL, entry_price REAL, exit_price REAL, status TEXT, 
-                    pnl REAL, mode TEXT, consensus REAL, dispersion REAL, 
-                    sector TEXT, ai_reason TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-                conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-                conn.execute("CREATE TABLE IF NOT EXISTS sector_cache (symbol TEXT PRIMARY KEY, sector TEXT)")
-            SYSTEM_STATE["health"]["db"] = "connected"
-        except Exception as e:
-            SLOG.log("db_error", level="critical", error=str(e)); sys.exit(1)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY, client_id TEXT UNIQUE, symbol TEXT, 
+                qty REAL, entry_price REAL, exit_price REAL, status TEXT, 
+                pnl REAL, mode TEXT, consensus REAL, dispersion REAL, 
+                sector TEXT, ai_reason TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+            conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS sector_cache (symbol TEXT PRIMARY KEY, sector TEXT)")
+        SYSTEM_STATE["health"]["db"] = "connected"
 
     def _load_anchor(self):
         with sqlite3.connect(DB_PATH) as conn:
@@ -248,16 +241,6 @@ class TitanEngine:
                 conn.execute("INSERT INTO meta (key, value) VALUES ('initial_equity', ?)", (equity,))
                 return equity
             except: sys.exit(1)
-
-    def _backup_db(self):
-        if not os.path.exists(BACKUP_DIR): os.makedirs(BACKUP_DIR)
-        target = os.path.join(BACKUP_DIR, f"titan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
-        try:
-            shutil.copy2(DB_PATH, target)
-            with sqlite3.connect(target) as conn:
-                if conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok":
-                    SLOG.log("backup_ok", file=target)
-        except Exception as e: SLOG.log("backup_fail", level="error", error=str(e))
 
     def get_sector_with_cache(self, symbol):
         with sqlite3.connect(DB_PATH) as conn:
@@ -271,23 +254,19 @@ class TitanEngine:
         except: return "Unknown"
 
     async def get_signals_cached(self, session):
-        """Alpha Vantage Cache (TTL 1h) - Optimisation Whale."""
         now = datetime.now()
         if self.av_cache and self.last_av_fetch and (now - self.last_av_fetch).total_seconds() < 3600:
             return self.av_cache
-            
         url = f"https://www.alphavantage.co/query?function=EARNINGS_CALENDAR&horizon=3month&apikey={AV_KEY}"
         try:
-            data = await fetch_with_retry(session, url)
-            if data:
-                df = pd.read_csv(io.BytesIO(data))
-                self.av_cache = df[df['reportDate'] == now.strftime('%Y-%m-%d')]
-                self.last_av_fetch = now
-                SYSTEM_STATE["health"]["av_api"] = "ok"
-                return self.av_cache
-        except Exception as e:
-            SLOG.log("av_fetch_error", level="warning", error=str(e))
-            SYSTEM_STATE["health"]["av_api"] = "error"
+            async with session.get(url, timeout=20) as resp:
+                if resp.status == 200:
+                    df = pd.read_csv(io.BytesIO(await resp.read()))
+                    self.av_cache = df[df['reportDate'] == now.strftime('%Y-%m-%d')]
+                    self.last_av_fetch = now
+                    SYSTEM_STATE["health"]["av_api"] = "ok"
+                    return self.av_cache
+        except: pass
         return pd.DataFrame()
 
     def sync_forge(self):
@@ -305,43 +284,70 @@ class TitanEngine:
                     else: SYSTEM_STATE["allocation"][m] = 1.0
                 SYSTEM_STATE["stats"][m] = {"expectancy": round(exp, 2), "trades": count}
 
+    async def reconcile_trades(self, positions):
+        pos_map = {p.symbol: p for p in positions}
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT client_id, symbol, entry_price, qty, timestamp FROM trades WHERE status='OPEN'")
+            for c_id, sym, entry, qty, ts in cursor.fetchall():
+                if (datetime.now() - datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')).days >= GOUVERNANCE["MAX_HOLDING_DAYS"]:
+                    self.alpaca.close_position(sym); continue
+                if sym not in pos_map:
+                    orders = self.alpaca.list_orders(status='closed', limit=5, symbols=[sym])
+                    if orders:
+                        latest = sorted(orders, key=lambda x: x.filled_at if x.filled_at else x.submitted_at, reverse=True)[0]
+                        exit_p = float(latest.filled_avg_price)
+                        cursor.execute("UPDATE trades SET status='CLOSED', exit_price=?, pnl=? WHERE client_id=?", 
+                                     (exit_p, (exit_p - entry) * qty, c_id))
+            conn.commit()
+
+    async def get_ai_score(self, session, c):
+        if not OR_KEY: return 82.0, 12.0, "SIMULATION: Clé manquante"
+        prompt = f"Analyste PEAD. {c['symbol']} ({c['sector']}). JSON: score(0-100), sigma(0-50), reason [FUND]|[TECH]|[VETO]."
+        try:
+            async with session.post("https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OR_KEY}"},
+                json={"model": "google/gemini-2.0-flash-001", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}},
+                timeout=12) as resp:
+                if resp.status == 200:
+                    res = await resp.json()
+                    data = json.loads(res['choices'][0]['message']['content'])
+                    return float(data.get('score', 80)), float(data.get('sigma', 15)), data.get('reason', 'N/A')
+        except: pass
+        return 80.0, 15.0, "FALLBACK: Erreur IA"
+
     async def run_cycle(self):
         try:
             with open(HEARTBEAT_FILE, "w") as f: f.write(datetime.now().isoformat())
             SYSTEM_STATE["health"]["last_cycle"] = datetime.now().isoformat()
             
-            # 1. Health Checks
             h_status = self.health.check_all(self.alpaca)
             if not all(h_status.values()):
                 SYSTEM_STATE["status"] = "unhealthy_halt"
-                SLOG.log("system_unhealthy", level="critical", checks=h_status)
                 if ENV_MODE == "LIVE": self.alpaca.close_all_positions()
                 return
 
-            # 2. Sync unique
             positions = self.alpaca.list_positions()
             acc = self.alpaca.get_account()
             equity = float(acc.equity)
             SYSTEM_STATE["equity"] = equity
+            SYSTEM_STATE["daily_pnl_usd"] = equity - float(acc.last_equity)
             
-            # 3. Kill-Switches
-            daily_dd = (equity - float(acc.last_equity)) / float(acc.last_equity)
-            if daily_dd <= -GOUVERNANCE["MAX_DAILY_DRAWDOWN_PCT"]:
-                SYSTEM_STATE["status"] = "halt_daily_dd"
-                self.alpaca.close_all_positions(); return
+            await self.reconcile_trades(positions)
+            self.sync_forge()
+            
+            if (equity - float(acc.last_equity)) / float(acc.last_equity) <= -GOUVERNANCE["MAX_DAILY_DRAWDOWN_PCT"]:
+                self.alpaca.close_all_positions(); SYSTEM_STATE["status"] = "halt_daily_dd"; return
 
             if not self.alpaca.get_clock().is_open or os.path.exists(HALT_FILE):
                 SYSTEM_STATE["status"] = "standby"; return
 
-            # 4. Scanning & Trading
             SYSTEM_STATE["status"] = "scanning"
             open_symbols = set(p.symbol for p in positions)
             sector_map = {p.symbol: self.get_sector_with_cache(p.symbol) for p in positions}
             
             async with aiohttp.ClientSession() as session:
                 candidates = await self.get_signals_cached(session)
-                self.sync_forge()
-                
                 for _, row in candidates.iterrows():
                     sym = row['symbol']
                     if sym in open_symbols or sym in GOUVERNANCE["BLACKLIST"]: continue
@@ -355,8 +361,7 @@ class TitanEngine:
                         exp_val = sum(float(p.market_value) for p in positions if sector_map.get(p.symbol) == sector)
                         if (exp_val / equity) >= GOUVERNANCE["MAX_SECTOR_EXPOSURE_PCT"]: continue
 
-                        # Adjudication IA
-                        score, sigma, reason = await self._call_ia(session, sym, sector)
+                        score, sigma, reason = await self.get_ai_score(session, {"symbol": sym, "sector": sector})
                         mode = "EXPLOITATION" if score >= 85 and sigma <= 20 else "EXPLORATION" if score >= 72 and sigma <= 35 else None
 
                         if mode and SYSTEM_STATE["allocation"][mode] > 0:
@@ -372,33 +377,18 @@ class TitanEngine:
                                     "client_order_id": f"apex_{uuid.uuid4().hex[:8]}"
                                 }
                                 if await self.executor.secure_submit(params):
+                                    SYSTEM_STATE["last_trade"] = {"symbol": sym, "consensus": score, "ai_reason": reason}
                                     with sqlite3.connect(DB_PATH) as conn:
                                         conn.execute("INSERT INTO trades (client_id, symbol, qty, entry_price, status, sector, mode, consensus, ai_reason) VALUES (?,?,?,?,?,?,?,?,?)",
                                                      (params["client_order_id"], sym, qty, price, 'OPEN', sector, mode, score, reason))
                     except: continue
-
         except Exception as e:
             SYSTEM_STATE["health"]["consecutive_errors"] += 1
-            SLOG.log("cycle_crash", level="critical", error=str(e), trace=traceback.format_exc())
-
-    async def _call_ia(self, session, sym, sector):
-        if not OR_KEY: return 82.0, 12.0, "SIMULATION"
-        prompt = f"Expert PEAD. Analyse {sym} ({sector}). JSON: score(0-100), sigma(0-50), reason [FUND]|[TECH]|[VETO]."
-        try:
-            res = await fetch_with_retry(session, "https://openrouter.ai/api/v1/chat/completions", 
-                headers={"Authorization": f"Bearer {OR_KEY}"},
-                json_data={"model": "google/gemini-2.0-flash-001", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}},
-                method="POST")
-            if res:
-                data = json.loads(res['choices'][0]['message']['content'])
-                return float(data.get('score', 80)), float(data.get('sigma', 15)), data.get('reason', 'N/A')
-        except: pass
-        return 80.0, 15.0, "FALLBACK"
+            SLOG.log("cycle_crash", level="critical", error=str(e))
 
 async def main():
-    # 1. Start Secure Metrics Server
+    # Démarrage du serveur de métriques
     threading.Thread(target=HTTPServer(('0.0.0.0', 8080), SecureMetricsHandler).serve_forever, daemon=True).start()
-    # 2. Start Engine
     engine = TitanEngine()
     SLOG.log("system_online", version=SYSTEM_STATE["engine_version"])
     while True:
@@ -406,4 +396,4 @@ async def main():
 
 if __name__ == "__main__":
     try: asyncio.run(main())
-    except KeyboardInterrupt: SLOG.log("shutdown"); sys.exit(0)
+    except KeyboardInterrupt: sys.exit(0)
