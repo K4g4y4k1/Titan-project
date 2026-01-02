@@ -1,5 +1,5 @@
 #!/bin/bash
-# Script de déploiement Titan v5.6 "Apex-Guardian"
+# Script de déploiement Titan v5.6.5 "APEX-ULTIMATE"
 # Cible : Ubuntu 22.04+ | Python 3.12
 
 echo "🚀 Initialisation de Titan v5.6..."
@@ -28,7 +28,7 @@ pip install alpaca-trade-api pandas numpy aiohttp yfinance python-dotenv
 echo "⚙️ Installation de Pandas-TA (Branche Development)..."
 pip install pandas-ta
 
-echo "✅ Environnement v5.6 prêt."
+echo "✅ Environnement v5.6.5 prêt."
 echo "1. Configurez le fichier /etc/systemd/system/titan-core.service"
 echo "2. Activez avec : sudo systemctl enable --now titan-core"
 
