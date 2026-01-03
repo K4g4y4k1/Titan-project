@@ -31,7 +31,6 @@ HEARTBEAT_FILE = ".daemon_heartbeat"
 # Si absent, on utilise un fallback mais on log un avertissement critique.
 DASHBOARD_TOKEN = os.getenv("TITAN_DASHBOARD_TOKEN")
 if not DASHBOARD_TOKEN:
-    DASHBOARD_TOKEN = "12345" # Fallback temporaire
     TOKEN_WARNING = True
 else:
     TOKEN_WARNING = False
