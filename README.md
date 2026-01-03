@@ -1,76 +1,67 @@
-# 🛡️ Titan v5.6 "Apex-Guardian"
+# 🛡️ TITAN SENTINEL (v5.6.11-LTS)
 
-Titan v5.6 est un moteur de trading algorithmique haute performance spécialisé dans la stratégie PEAD (Post-Earnings Announcement Drift). Cette version "Apex-Guardian" fusionne l'agressivité de la v4.9.8 avec la rigueur institutionnelle de la v5.3.
+## Système de Trading Quantitatif PEAD & Architecture de Gouvernance "Grok-Sentinel"
+Titan est une infrastructure de trading algorithmique conçue pour exploiter le Post-Earnings Announcement Drift (PEAD) sur les marchés actions US. Le système intègre un pipeline de décision hybride mêlant filtrage déterministe rigoureux et arbitrage cognitif par LLM (Grok-2).
 
-## 🚀 Architecture Hybride "Full-Free"
+## 🚀 Philosophie : "Capital-First"
+- Le système est conçu avec une priorité absolue sur la préservation du capital.
+- Zéro Trade en cas de doute : Si les données ou le score IA sont ambigus, le système reste en cash.
+- Auto-Quarantaine : Les modes de trading se désactivent automatiquement en cas de performance négative glissante.
+- Gouvernance Multi-couches : Limites sectorielles, drawdown journalier et protection contre le slippage intégrées nativement.
 
-Pour garantir une indépendance totale vis-à-vis des abonnements payants (FMP), Titan v5.6 utilise un écosystème de données distribué :
+## 🏗️ Architecture Technique
+- Core : Python asyncio pour une exécution asynchrone non-bloquante.
+- Storage : SQLite avec mode WAL pour une persistance rapide et fiable.
+- Signal : Scan des résultats via Alpha Vantage & Analyse de sentiment/drift via Grok-2 (xAI).
+- Exécution : API Alpaca (Ordres Bracket : Limit + Take Profit + Stop Loss).
+- Monitoring : Dashboard temps réel via API sécurisée par HMAC.
 
-- Signal (Earnings) : Alpha Vantage (Via calendrier CSV optimisé).
+## 🛠️ Configuration & Installation
+### Pré-requis
+Vous aurez besoin des clés API suivantes :
+- Alpaca Markets (Trading)
+- Alpha Vantage (Données fondamentales)
+- OpenRouter (Accès à Grok-2)
 
-- Gouvernance (Secteurs) : yfinance (Avec système de cache SQLite local).
+### Installation
+- git clone [https://github.com/votre-compte/titan-sentinel.git](https://github.com/votre-compte/titan-sentinel.git)
+- cd titan-sentinel
+- pip install -r requirements.txt
 
-- Exécution (Prix & Ordres) : Alpaca Markets (Temps réel via API Broker).
+### Variables d'Environnement
+Créez un fichier .env ou exportez les variables suivantes :
+- export ENV_MODE="PAPER" # ou "LIVE"
+- export TITAN_DASHBOARD_TOKEN="votre_token_securise"
+- export ALPACA_API_KEY="votre_cle"
+- export ALPACA_SECRET_KEY="votre_secret"
+- export ALPHA_VANTAGE_KEY="votre_cle"
+- export OPENROUTER_API_KEY="votre_cle"
 
-- Intelligence : OpenRouter (Consensus IA via Gemini 2.0 Flash).
+## 📈 Pipeline de Décision
+Scanning : 
+- Extraction des entreprises publiant leurs résultats le jour J.
+- Filtrage : Application des règles de prix ($>5$), de blacklist et d'exposition sectorielle.
+- Arbitrage IA : Envoi du contexte à Grok-2 pour évaluation du potentiel de "drift".
 
-## 🛡️ Disjoncteurs & Gouvernance "Guardian"
+### Classification : 
+- Exploitation (Score $\ge$ 85, $\sigma \le$ 20)
+- Exploration (Score $\ge$ 72, $\sigma \le$ 35)
+- Exécution : Placement d'un ordre bracket avec Take Profit (+6%) et Stop Loss (-3%).
 
-Le système est protégé par une triple ceinture de sécurité :
+## 🛡️ Gouvernance & Risque
+Paramètre  /  Limite 
+- Max Drawdown Journalier:  2%,
+- Max Drawdown Total:        10%,
+- Exposition Sectorielle:    25% Max, 
+- Taille Position Max:       10% Max,
+- Rétention (Holding):       3 Jours Max.
 
-- Kill-Switch de Drawdown :
+## 📊 Monitoring
+Le système expose un endpoint de métriques sécurisé sur le port 8080.
+Auth : Bearer Token (HMAC)
+Data : Equity, positions ouvertes, ordres en attente, santé de la base de données et performance par mode.
 
-- Journalier (2%) : Liquidation totale et arrêt si l'équité chute de 2% sur la journée.
+## ⚠️ Avertissement (Disclaimer)
+Ce logiciel est fourni à titre éducatif et de recherche. Le trading algorithmique comporte des risques de perte totale du capital. L'utilisateur est seul responsable des configurations et des fonds engagés.
 
-- Total (10%) : Verrouillage matériel (fichier .halt_trading) si le capital baisse de 10% par rapport à l'ancre initiale.
-
-- Time-Exit (J+3) : Fermeture automatique des positions stagnantes après 3 jours de détention pour libérer le capital.
-
-- Capital Forge : Système de triage adaptatif qui place les stratégies en Quarantaine ou en mode Dégradé selon leur espérance mathématique réelle.
-
-- Veto Sectoriel : Limitation stricte à 25% d'exposition maximum par secteur d'activité.
-
-## 🛠️ Installation Rapide (AWS EC2)
-
-Préparation du serveur :
-
-- git clone <votre_repo> ~/titan-project
-- cd ~/titan-project
-- bash setup_aws.sh
-
-
-Configuration des Secrets : Éditez le fichier de service /etc/systemd/system/titan-core.service avec vos clés :
-
-- ALPACA_API_KEY / ALPACA_SECRET_KEY
-
-- ALPHA_VANTAGE_KEY
-
-- OPENROUTER_API_KEY
-
-Lancement :
-
-- sudo systemctl daemon-reload
-- sudo systemctl enable --now titan-core
-
-
-## 📟 Monitoring & Audit
-
-Le système expose ses métriques en temps réel sur le port 8080.
-
-- Dashboard Live : Accédez à http://<IP_AWS>:8080 (Assurez-vous que le port est ouvert dans votre Security Group AWS).
-
-- Audit des logs : journalctl -u titan-core -f
-
-- Preuve de vie : ls -l .daemon_heartbeat (Le fichier doit être mis à jour toutes les 60 secondes).
-
-## 📊 Structure des Fichiers
-
-- trading_daemon.py : Moteur principal asynchrone.
-
-- backtester.py : Simulateur de portefeuille synchronisé avec la logique v5.6.
-
-- titan_prod_v5.db : Base de données SQLite (Trades, Forge, Cache Sectoriel).
-
-- .halt_trading : Fichier de sécurité (créez-le pour arrêter le bot manuellement).
-
-Note de conformité : Ce logiciel est un outil d'assistance au trading. Le trading comporte des risques importants. Testez toujours en mode PAPER pendant au moins 15 jours avant toute utilisation en capital réel.
+Titan Sentinel - Built for stability, engineered for performance.
