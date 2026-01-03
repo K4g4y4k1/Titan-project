@@ -16,6 +16,7 @@ import hmac
 import aiohttp
 import traceback
 import time
+import requests  # Ajouté pour la session
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import alpaca_trade_api as tradeapi
@@ -29,10 +30,7 @@ HEARTBEAT_FILE = ".daemon_heartbeat"
 
 # SÉCURITÉ : Récupération du token via l'environnement
 DASHBOARD_TOKEN = os.getenv("TITAN_DASHBOARD_TOKEN")
-if not DASHBOARD_TOKEN:
-    TOKEN_WARNING = True
-else:
-    TOKEN_WARNING = False
+TOKEN_WARNING = not bool(DASHBOARD_TOKEN)
 
 ENV_MODE = os.getenv("ENV_MODE", "PAPER")
 ALPACA_KEY = os.getenv("ALPACA_API_KEY")
@@ -58,7 +56,10 @@ GOUVERNANCE = {
     },
     "BASE_TP_PCT": 0.06,
     "BASE_SL_PCT": 0.03,
-    "SLIPPAGE_PROTECTION": 0.002        
+    "SLIPPAGE_PROTECTION": 0.002,
+    "MIN_TRADES_FOR_JUDGEMENT": 10,
+    "QUARANTINE_THRESHOLD_USD": -50.0,
+    "DEGRADED_THRESHOLD_USD": 0.0
 }
 
 SYSTEM_STATE = {
@@ -123,8 +124,15 @@ class SecureMetricsHandler(BaseHTTPRequestHandler):
 
 class TitanEngine:
     def __init__(self):
-        self.alpaca = tradeapi.REST(ALPACA_KEY, ALPACA_SECRET, 
-            "https://api.alpaca.markets" if ENV_MODE == "LIVE" else "https://paper-api.alpaca.markets")
+        base_url = "https://api.alpaca.markets" if ENV_MODE == "LIVE" else "https://paper-api.alpaca.markets"
+        self.alpaca = tradeapi.REST(ALPACA_KEY, ALPACA_SECRET, base_url)
+        
+        # SÉCURISATION YAHOO : Session avec User-Agent réel
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+        })
+        
         self._init_db()
 
     def _init_db(self):
@@ -135,18 +143,22 @@ class TitanEngine:
         SYSTEM_STATE["health"]["db"] = "connected"
 
     def get_sector(self, sym):
+        """Récupération optimisée avec cache et session anti-blocage."""
         with sqlite3.connect(DB_PATH) as conn:
             res = conn.execute("SELECT sector FROM sector_cache WHERE symbol=?", (sym,)).fetchone()
             if res: return res[0]
         try:
-            s = yf.Ticker(sym).info.get('sector', 'Unknown')
+            # Utilisation de la session sécurisée
+            ticker = yf.Ticker(sym, session=self.session)
+            s = ticker.info.get('sector', 'Unknown')
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute("INSERT OR REPLACE INTO sector_cache VALUES (?,?)", (sym, s))
             return s
-        except: return "Unknown"
+        except Exception as e:
+            SLOG.log("yahoo_error", level="warning", symbol=sym, error=str(e))
+            return "Unknown"
 
     async def get_ai_score(self, session, sym, sector, price):
-        """Validation cognitive via OpenRouter (Grok 2)."""
         prompt = (
             f"Analyse quantitative PEAD pour {sym} (Secteur: {sector}). "
             f"Prix actuel: {price}$. "
@@ -156,7 +168,7 @@ class TitanEngine:
         headers = {"Authorization": f"Bearer {OR_KEY}", "Content-Type": "application/json"}
         payload = {"model": "x-ai/grok-2-1212", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
 
-        for i in range(5): # Retry Logic Robuste (Recommandation Audit #3)
+        for i in range(5):
             try:
                 async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=15) as resp:
                     if resp.status == 200:
@@ -169,7 +181,6 @@ class TitanEngine:
         return 80.0, 15.0, "IA_TIMEOUT_FALLBACK"
 
     async def reconcile(self, positions):
-        """Audit #4 : Active symbols centralisés et synchronisation UI."""
         active_symbols = set([p.symbol for p in positions])
         SYSTEM_STATE["positions"] = [{
             "symbol": p.symbol, "qty": p.qty, "market_price": p.current_price, 
@@ -211,8 +222,6 @@ class TitanEngine:
             if not self.alpaca.get_clock().is_open or os.path.exists(HALT_FILE):
                 SYSTEM_STATE["status"] = "standby"; return
 
-            # AUDIT #1 : Optimisation Sector Cache Performance
-            # On pré-calcule le map des secteurs des positions actuelles AVANT la boucle
             sector_map = {p.symbol: self.get_sector(p.symbol) for p in positions}
 
             SYSTEM_STATE["status"] = "scanning"
@@ -230,7 +239,6 @@ class TitanEngine:
                     price = float(self.alpaca.get_latest_trade(sym).price)
                     sector = self.get_sector(sym)
                     
-                    # Utilisation du sector_map optimisé (Audit #1)
                     sector_val = sum(float(p.market_value) for p in positions if sector_map.get(p.symbol) == sector)
                     if (sector_val / SYSTEM_STATE["equity"]) >= GOUVERNANCE["MAX_SECTOR_EXPOSURE_PCT"]: continue
 
@@ -243,7 +251,6 @@ class TitanEngine:
                                   int((SYSTEM_STATE["equity"] * GOUVERNANCE["MAX_POSITION_SIZE_PCT"]) / price))
                         
                         if qty > 0:
-                            # AUDIT #2 : Order Verification & Exception Handling
                             try:
                                 params = {
                                     "symbol": sym, "qty": qty, "side": 'buy', "type": 'limit',
@@ -256,7 +263,6 @@ class TitanEngine:
                                 order = self.alpaca.submit_order(**params)
                                 SLOG.log("order_submitted", id=order.id, symbol=sym)
 
-                                # Vérification post-ordre (Audit #2)
                                 await asyncio.sleep(3)
                                 check = self.alpaca.get_order(order.id)
                                 if check.status == 'rejected':
