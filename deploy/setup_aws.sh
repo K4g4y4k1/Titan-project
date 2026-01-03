@@ -1,5 +1,5 @@
 #!/bin/bash
-# Script de déploiement Titan v5.6.5 "APEX-ULTIMATE"
+# Script de déploiement Titan v5.6.11 "APEX-ULTIMATE"
 # Cible : Ubuntu 22.04+ | Python 3.12
 
 echo "🚀 Initialisation de Titan v5.6..."
