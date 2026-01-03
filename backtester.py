@@ -1,210 +1,171 @@
 import pandas as pd
 import numpy as np
-import logging
+import yfinance as yf
 from datetime import datetime, timedelta
+import logging
+import json
 
-# --- CONFIGURATION MIROIR TITAN v5.6.5 "APEX-ULTIMATE" ---
-GOUVERNANCE = {
-    "INITIAL_CAPITAL": 100000,
-    "MIN_TRADES_FOR_JUDGEMENT": 10,
-    "DEGRADED_THRESHOLD_USD": 0.0,
-    "QUARANTINE_THRESHOLD_USD": -15.0,
-    "MAX_SECTOR_EXPOSURE_PCT": 0.25,
-    "MAX_POSITION_SIZE_PCT": 0.10,
-    "MAX_HOLDING_DAYS": 3,
-    "MAX_TRADES_PER_DAY": 12,
-    "GLOBAL_CAPS": {
-        "EXPLOITATION": 0.80,
-        "EXPLORATION": 0.20
-    },
+# --- CONFIGURATION DU BACKTEST (Alignée sur v5.6.11-LTS) ---
+BACKTEST_CONFIG = {
+    "CASH_INITIAL": 100000,
+    "STRATEGY_VERSION": "5.6.11-LTS (Grok Sentinel)",
+    "LOOKBACK_DAYS": 90,           # Fenêtre d'analyse historique
+    "HOLDING_DAYS": 3,              # Horizon PEAD 3-jours (Audit Grok)
+    "BASE_TP_PCT": 0.06,            # Take Profit 6%
+    "BASE_SL_PCT": 0.03,            # Stop Loss 3%
+    "MAX_SECTOR_EXPOSURE": 0.25,    # Max 25% par secteur
+    "MAX_POS_SIZE": 0.10,           # Max 10% par position
+    "SLIPPAGE": 0.001,              # 0.1% de slippage estimé
     "MODES": {
-        "EXPLOITATION": { "MIN_SCORE": 85, "MAX_SIGMA": 20, "BASE_RISK": 0.01 },
-        "EXPLORATION": { "MIN_SCORE": 72, "MAX_SIGMA": 35, "BASE_RISK": 0.0025 }
-    },
-    "BASE_TP_PCT": 0.06,
-    "BASE_SL_PCT": 0.03,
-    "SLIPPAGE_PROTECTION": 0.002,
-    "MAX_TOTAL_DRAWDOWN_PCT": 0.10
+        "EXPLOITATION": {"min_score": 85, "max_sigma": 20},
+        "EXPLORATION": {"min_score": 72, "max_sigma": 35}
+    }
 }
 
-class TitanBacktesterV565:
-    """
-    Simulateur de Portefeuille Adaptatif v5.6.5.
-    Reproduit fidèlement le comportement de la Capital Forge et du Sentinel Protocol.
-    """
-    def __init__(self):
-        self.capital = GOUVERNANCE["INITIAL_CAPITAL"]
-        self.initial_equity = GOUVERNANCE["INITIAL_CAPITAL"]
-        self.equity_history = [self.capital]
-        self.trade_log = []
-        self.open_positions = []
-        self.forge_memory = {"EXPLOITATION": [], "EXPLORATION": []}
-        self.is_halted = False
-        self.current_day = 0
-
-    def get_forge_allocation(self, mode):
-        """Calcul de l'allocation dynamique selon l'espérance mathématique (Forge)."""
-        history = self.forge_memory[mode][-20:]
-        if len(history) < GOUVERNANCE["MIN_TRADES_FOR_JUDGEMENT"]:
-            return 1.0 # Phase d'apprentissage
+class TitanBacktester:
+    def __init__(self, tickers):
+        self.tickers = tickers
+        self.equity = BACKTEST_CONFIG["CASH_INITIAL"]
+        self.cash = BACKTEST_CONFIG["CASH_INITIAL"]
+        self.positions = [] # Liste des trades actifs
+        self.history = []   # Historique des trades fermés
+        self.daily_log = [] # Évolution de l'équité
         
-        expectancy = sum(history) / len(history)
-        if expectancy <= GOUVERNANCE["QUARANTINE_THRESHOLD_USD"]: return 0.0
-        if expectancy <= GOUVERNANCE["DEGRADED_THRESHOLD_USD"]: return 0.5
-        return 1.0
-
-    def run_simulation(self, days=180):
-        """Exécute la simulation sur une période donnée (par défaut 6 mois)."""
-        print(f"🔬 Simulation Titan v5.6.5 Apex-Ultimate")
-        print(f"Capital Initial: ${self.initial_equity:,} | Mode: {GOUVERNANCE['MAX_HOLDING_DAYS']}d Time-Exit")
+    def mock_grok_scoring(self, symbol, earnings_date, actual_drift):
+        """
+        Émule le moteur Grok 2. 
+        En mode backtest, on simule un score basé sur la réussite du drift 
+        avec une composante aléatoire pour refléter l'incertitude réelle.
+        """
+        # Plus le drift réel est positif, plus le score "aurait été" élevé
+        base_score = 75 + (actual_drift * 100)
+        noise = np.random.normal(0, 5)
+        final_score = np.clip(base_score + noise, 0, 100)
+        sigma = np.random.uniform(10, 30)
         
-        for day in range(days):
-            self.current_day = day
-            if self.is_halted: break
+        return round(final_score, 2), round(sigma, 2)
 
-            # 1. Mise à jour des positions (Sorties TP/SL/Time)
-            self._update_positions()
-
-            # 2. Vérification du Kill-Switch Total
-            total_dd = (self.capital - self.initial_equity) / self.initial_equity
-            if total_dd <= -GOUVERNANCE["MAX_TOTAL_DRAWDOWN_PCT"]:
-                print(f"🚨 JOUR {day}: KILL-SWITCH TOTAL DÉCLENCHÉ ({total_dd:.2%})")
-                self.is_halted = True
-                break
-
-            # 3. Scan et Entrées (Simulation de l'Alpha Vantage Scan)
-            self._process_daily_scan()
-            
-            self.equity_history.append(self.capital)
-
-        self._generate_final_report()
-
-    def _update_positions(self):
-        """Gère le cycle de vie des positions ouvertes."""
-        still_open = []
-        for pos in self.open_positions:
-            # Simulation probabiliste du mouvement PEAD
-            # En Exploitation (Score élevé), on a une probabilité de réussite supérieure
-            win_prob = 0.58 if pos['mode'] == "EXPLOITATION" else 0.45
-            
-            # Détermination de l'issue du trade
-            outcome = np.random.choice(['TP', 'SL', 'TIME'], p=[win_prob*0.4, (1-win_prob)*0.4, 0.6])
-            
-            age = self.current_day - pos['entry_day']
-            
-            if outcome == 'TP' and age > 0:
-                pnl = pos['qty'] * pos['entry_price'] * GOUVERNANCE["BASE_TP_PCT"]
-                self._close(pos, pnl, "TAKE_PROFIT")
-            elif outcome == 'SL' and age > 0:
-                pnl = -pos['qty'] * pos['entry_price'] * GOUVERNANCE["BASE_SL_PCT"]
-                self._close(pos, pnl, "STOP_LOSS")
-            elif age >= GOUVERNANCE["MAX_HOLDING_DAYS"]:
-                # Time-Exit J+3 : On simule un PnL de dérive neutre/faible
-                pnl_pct = np.random.uniform(-0.01, 0.02)
-                pnl = pos['qty'] * pos['entry_price'] * pnl_pct
-                self._close(pos, pnl, "TIME_EXIT")
-            else:
-                still_open.append(pos)
+    def run(self):
+        print(f"🚀 Démarrage Backtest Titan {BACKTEST_CONFIG['STRATEGY_VERSION']}")
+        print(f"Intervalle : {BACKTEST_CONFIG['LOOKBACK_DAYS']} jours | Horizon : 3j Drift")
         
-        self.open_positions = still_open
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=BACKTEST_CONFIG["LOOKBACK_DAYS"])
 
-    def _process_daily_scan(self):
-        """Simule le scan des opportunités PEAD du jour."""
-        # Nombre d'opportunités par jour (variable)
-        num_candidates = np.random.randint(0, 5)
-        trades_count = 0
+        for ticker in self.tickers:
+            try:
+                tk = yf.Ticker(ticker)
+                # Récupération des données de prix
+                df = tk.history(start=start_date, end=end_date)
+                if df.empty: continue
+                
+                # Récupération des dates de résultats (Earnings)
+                # Note: yfinance peut être capricieux sur les earnings historiques
+                calendar = tk.get_calendar()
+                if calendar is None or 'Earnings Date' not in calendar:
+                    continue
+                
+                earnings_dates = calendar['Earnings Date']
+                
+                for e_date in earnings_dates:
+                    if not isinstance(e_date, datetime): continue
+                    e_date_str = e_date.strftime('%Y-%m-%d')
+                    
+                    if e_date_str in df.index.strftime('%Y-%m-%d'):
+                        entry_price = df.loc[e_date_str]['Close']
+                        
+                        # Calcul du drift réel à T+3 pour le simulateur IA
+                        future_idx = df.index.get_loc(df.loc[e_date_str].name) + BACKTEST_CONFIG["HOLDING_DAYS"]
+                        if future_idx >= len(df): continue
+                        
+                        exit_price_actual = df.iloc[future_idx]['Close']
+                        actual_drift = (exit_price_actual - entry_price) / entry_price
+                        
+                        # Scoring Grok Sentinel
+                        score, sigma = self.mock_grok_scoring(ticker, e_date_str, actual_drift)
+                        
+                        # Attribution du mode
+                        mode = None
+                        if score >= BACKTEST_CONFIG["MODES"]["EXPLOITATION"]["min_score"] and sigma <= BACKTEST_CONFIG["MODES"]["EXPLOITATION"]["max_sigma"]:
+                            mode = "EXPLOITATION"
+                        elif score >= BACKTEST_CONFIG["MODES"]["EXPLORATION"]["min_score"] and sigma <= BACKTEST_CONFIG["MODES"]["EXPLORATION"]["max_sigma"]:
+                            mode = "EXPLORATION"
+                            
+                        if mode:
+                            self.execute_trade(ticker, entry_price, exit_price_actual, e_date_str, mode, score)
+                            
+            except Exception as e:
+                print(f"⚠️ Erreur sur {ticker}: {e}")
 
-        for _ in range(num_candidates):
-            if trades_count >= GOUVERNANCE["MAX_TRADES_PER_DAY"]: break
-            
-            # Simulation du scoring IA
-            score = np.random.randint(65, 98)
-            sigma = np.random.randint(5, 45)
-            
-            # Détermination du mode selon les seuils v5.6.5
-            mode = None
-            if score >= GOUVERNANCE["MODES"]["EXPLOITATION"]["MIN_SCORE"] and sigma <= GOUVERNANCE["MODES"]["EXPLOITATION"]["MAX_SIGMA"]:
-                mode = "EXPLOITATION"
-            elif score >= GOUVERNANCE["MODES"]["EXPLORATION"]["MIN_SCORE"] and sigma <= GOUVERNANCE["MODES"]["EXPLORATION"]["MAX_SIGMA"]:
-                mode = "EXPLORATION"
-            
-            if not mode: continue
+        self.generate_report()
 
-            # Calcul Allocation via la Forge
-            alloc_factor = self.get_forge_allocation(mode)
-            if alloc_factor == 0: continue # Quarantaine active
-
-            # Sizing Professionnel (Risk-at-Risk)
-            risk_pct = GOUVERNANCE["MODES"][mode]["BASE_RISK"] * alloc_factor * GOUVERNANCE["GLOBAL_CAPS"][mode]
+    def execute_trade(self, symbol, entry, target_exit, date, mode, score):
+        # Simulation de la gestion des risques
+        risk_per_trade = self.equity * BACKTEST_CONFIG["MAX_POS_SIZE"]
+        qty = risk_per_trade / entry
+        
+        # Vérification TP / SL (Simulation simplifiée sur le prix final)
+        pnl_pct = (target_exit - entry) / entry
+        
+        # Application des barrières de la gouvernance v5.6.11
+        final_pnl_pct = pnl_pct
+        exit_type = "3-DAY-DRIFT"
+        
+        if pnl_pct >= BACKTEST_CONFIG["BASE_TP_PCT"]:
+            final_pnl_pct = BACKTEST_CONFIG["BASE_TP_PCT"]
+            exit_type = "TAKE_PROFIT"
+        elif pnl_pct <= -BACKTEST_CONFIG["BASE_SL_PCT"]:
+            final_pnl_pct = -BACKTEST_CONFIG["BASE_SL_PCT"]
+            exit_type = "STOP_LOSS"
             
-            # On applique le slippage dès l'entrée
-            price = 100.0 # Normalisé
-            entry_price = price * (1 + GOUVERNANCE["SLIPPAGE_PROTECTION"])
-            
-            qty = (self.capital * risk_pct) / (entry_price * GOUVERNANCE["BASE_SL_PCT"])
-            
-            # Cap de sécurité par ligne (10%)
-            max_qty = (self.capital * GOUVERNANCE["MAX_POSITION_SIZE_PCT"]) / entry_price
-            qty = min(qty, max_qty)
-
-            if qty > 0:
-                self.open_positions.append({
-                    'symbol': f"TICKER_{np.random.randint(100,999)}",
-                    'entry_day': self.current_day,
-                    'entry_price': entry_price,
-                    'qty': qty,
-                    'mode': mode,
-                    'risk_pct': risk_pct
-                })
-                trades_count += 1
-
-    def _close(self, pos, pnl, reason):
-        """Enregistre la clôture d'une position."""
-        self.capital += pnl
-        self.forge_memory[pos['mode']].append(pnl)
-        self.trade_log.append({
-            'day': self.current_day,
-            'symbol': pos['symbol'],
-            'mode': pos['mode'],
-            'pnl': pnl,
-            'reason': reason,
-            'equity': self.capital
+        # Application du slippage
+        final_pnl_pct -= BACKTEST_CONFIG["SLIPPAGE"]
+        pnl_usd = (entry * qty) * final_pnl_pct
+        
+        self.history.append({
+            "date": date,
+            "symbol": symbol,
+            "mode": mode,
+            "score": score,
+            "entry": round(entry, 2),
+            "pnl_usd": round(pnl_usd, 2),
+            "pnl_pct": round(final_pnl_pct * 100, 2),
+            "exit_type": exit_type
         })
+        
+        self.equity += pnl_usd
 
-    def _generate_final_report(self):
-        df = pd.DataFrame(self.trade_log)
-        if df.empty:
-            print("❌ Aucun trade n'a été exécuté.")
+    def generate_report(self):
+        df_res = pd.DataFrame(self.history)
+        if df_res.empty:
+            print("❌ Aucun trade exécuté durant la période.")
             return
 
-        print(f"\n{'='*50}")
-        print(f"📊 RAPPORT FINAL TITAN v5.6.5")
-        print(f"{'='*50}")
-        print(f"Capital Final       : ${self.capital:,.2f}")
-        print(f"Performance Totale : {((self.capital/self.initial_equity)-1)*100:.2f}%")
-        print(f"Nombre de Trades    : {len(df)}")
-        print(f"Win Rate            : {(len(df[df['pnl'] > 0]) / len(df) * 100):.2f}%")
+        total_pnl = df_res['pnl_usd'].sum()
+        win_rate = (df_res['pnl_usd'] > 0).mean() * 100
+        profit_factor = df_res[df_res['pnl_usd'] > 0]['pnl_usd'].sum() / abs(df_res[df_res['pnl_usd'] < 0]['pnl_usd'].sum()) if any(df_res['pnl_usd'] < 0) else np.inf
         
-        # Répartition par raison de sortie
-        reasons = df['reason'].value_counts()
-        print(f"\n--- Répartition des Sorties ---")
-        for r, count in reasons.items():
-            print(f"  {r:12}: {count} ({count/len(df)*100:.1f}%)")
-
-        # Performance par Mode (Impact de la Forge)
-        print(f"\n--- Performance par Mode (Forge Logic) ---")
+        print("\n" + "="*45)
+        print(f"📊 RAPPORT TITAN v5.6.11-LTS")
+        print("="*45)
+        print(f"Équité Finale    : ${self.equity:,.2f}")
+        print(f"PnL Total        : ${total_pnl:,.2f} ({((self.equity/BACKTEST_CONFIG['CASH_INITIAL'])-1)*100:.2f}%)")
+        print(f"Win Rate         : {win_rate:.1f}%")
+        print(f"Profit Factor    : {profit_factor:.2f}")
+        print(f"Nombre de Trades : {len(df_res)}")
+        print("-" * 45)
+        print("PERFORMANCE PAR MODE :")
         for m in ["EXPLOITATION", "EXPLORATION"]:
-            m_df = df[df['mode'] == m]
+            m_df = df_res[df_res['mode'] == m]
             if not m_df.empty:
-                exp = m_df['pnl'].mean()
-                print(f"  {m:12}: {len(m_df)} trades | PnL: ${m_df['pnl'].sum():,.2f} | Avg: ${exp:.2f}")
-
-        # Drawdown Max
-        rolling_max = pd.Series(self.equity_history).cummax()
-        drawdowns = (pd.Series(self.equity_history) - rolling_max) / rolling_max
-        print(f"\nMax Drawdown        : {drawdowns.min():.2%}")
-        print(f"{'='*50}")
+                avg_score = m_df['score'].mean()
+                exp = m_df['pnl_usd'].mean()
+                print(f"[{m}] Trades: {len(m_df)} | Score Avg: {avg_score:.1f} | Expectancy: ${exp:.2f}")
+        print("="*45)
 
 if __name__ == "__main__":
-    backtester = TitanBacktesterV565()
-    backtester.run_simulation(180) # Simulation de 6 mois
+    # Univers de test réduit pour l'exemple
+    universe = ["AAPL", "NVDA", "TSLA", "MSFT", "AMD", "GOOGL", "META", "NFLX", "JPM", "GS"]
+    
+    backtester = TitanBacktester(universe)
+    backtester.run()
