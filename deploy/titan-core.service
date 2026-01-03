@@ -1,5 +1,5 @@
 [Unit]
-Description=Titan-Core v5.6.5 APEX-ULTIMATE
+Description=Titan-Core v5.6.11 APEX-ULTIMATE
 After=network.target
 
 [Service]
@@ -21,6 +21,7 @@ Environment=ALPACA_SECRET_KEY=VOTRE_SECRET_ICI
 Environment=FMP_API_KEY=VOTRE_FMP_ICI
 Environment=OPENROUTER_API_KEY=VOTRE_OR_ICI
 Environment=ALPHA_VANTAGE_KEY=VOTRE_CLE_AV
+Environment=TITAN_DASHBOARD_TOKEN=VOTRE_CLE_ICI
 
 # Sécurité système
 NoNewPrivileges=true
