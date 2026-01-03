@@ -1,171 +1,167 @@
 import pandas as pd
-import numpy as np
 import yfinance as yf
+import numpy as np
+import os
+import time
 from datetime import datetime, timedelta
-import logging
-import json
 
-# --- CONFIGURATION DU BACKTEST (Alignée sur v5.6.11-LTS) ---
-BACKTEST_CONFIG = {
-    "CASH_INITIAL": 100000,
-    "STRATEGY_VERSION": "5.6.11-LTS (Grok Sentinel)",
-    "LOOKBACK_DAYS": 90,           # Fenêtre d'analyse historique
-    "HOLDING_DAYS": 3,              # Horizon PEAD 3-jours (Audit Grok)
-    "BASE_TP_PCT": 0.06,            # Take Profit 6%
-    "BASE_SL_PCT": 0.03,            # Stop Loss 3%
-    "MAX_SECTOR_EXPOSURE": 0.25,    # Max 25% par secteur
-    "MAX_POS_SIZE": 0.10,           # Max 10% par position
-    "SLIPPAGE": 0.001,              # 0.1% de slippage estimé
+# --- CONFIGURATION STRICTE TITAN 5.6.11 ---
+START_DATE = "2023-01-01"
+END_DATE = "2024-01-01"
+INITIAL_CAPITAL = 100000
+SYMBOLS_TO_TEST = ["AAPL", "TSLA", "NVDA", "AMD", "MSFT", "GOOGL", "META", "NFLX", "AMZN"]
+CACHE_DIR = "market_data_cache"
+
+# GOUVERNANCE STRICTE (Issue de ton code source)
+GOUVERNANCE = {
+    "MAX_SECTOR_EXPOSURE_PCT": 0.25,
+    "MAX_POSITION_SIZE_PCT": 0.10,
+    "BASE_TP_PCT": 0.06,
+    "BASE_SL_PCT": 0.03,
+    "SLIPPAGE_PROTECTION": 0.002,
+    "MAX_HOLDING_DAYS": 3,
     "MODES": {
-        "EXPLOITATION": {"min_score": 85, "max_sigma": 20},
-        "EXPLORATION": {"min_score": 72, "max_sigma": 35}
+        "EXPLOITATION": { "MIN_SCORE": 85, "MAX_SIGMA": 20, "BASE_RISK": 0.01 },
+        "EXPLORATION": { "MIN_SCORE": 72, "MAX_SIGMA": 35, "BASE_RISK": 0.0025 }
     }
 }
 
-class TitanBacktester:
-    def __init__(self, tickers):
-        self.tickers = tickers
-        self.equity = BACKTEST_CONFIG["CASH_INITIAL"]
-        self.cash = BACKTEST_CONFIG["CASH_INITIAL"]
-        self.positions = [] # Liste des trades actifs
-        self.history = []   # Historique des trades fermés
-        self.daily_log = [] # Évolution de l'équité
-        
-    def mock_grok_scoring(self, symbol, earnings_date, actual_drift):
-        """
-        Émule le moteur Grok 2. 
-        En mode backtest, on simule un score basé sur la réussite du drift 
-        avec une composante aléatoire pour refléter l'incertitude réelle.
-        """
-        # Plus le drift réel est positif, plus le score "aurait été" élevé
-        base_score = 75 + (actual_drift * 100)
-        noise = np.random.normal(0, 5)
-        final_score = np.clip(base_score + noise, 0, 100)
+class DataEngine:
+    def __init__(self, cache_dir):
+        self.cache_dir = cache_dir
+        if not os.path.exists(cache_dir): os.makedirs(cache_dir)
+
+    def get_data(self, symbol, start, end):
+        cache_path = os.path.join(self.cache_dir, f"{symbol}_{start}_{end}.csv")
+        if os.path.exists(cache_path):
+            df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            if not df.empty: return df
+
+        print(f"Extraction de {symbol}...")
+        try:
+            ticker = yf.Ticker(symbol)
+            time.sleep(1.2)
+            df = ticker.history(start=start, end=end, interval="1d", auto_adjust=True)
+            if df.empty: return pd.DataFrame()
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            df.to_csv(cache_path)
+            return df
+        except Exception as e:
+            print(f"❌ Erreur {symbol}: {e}")
+            return pd.DataFrame()
+
+class SimulatedBrain:
+    """Simule Grok-2 tel que défini dans ton TitanEngine."""
+    @staticmethod
+    def get_ai_score(symbol, date):
+        # Simulation déterministe basée sur la date et le symbole
+        seed = int(date.timestamp()) + sum(ord(c) for c in symbol)
+        np.random.seed(seed % 2**32)
+        score = np.random.normal(78, 10) # Moyenne proche de tes seuils
         sigma = np.random.uniform(10, 30)
-        
-        return round(final_score, 2), round(sigma, 2)
+        return score, sigma
+
+class TitanBacktester:
+    def __init__(self, symbols, initial_capital):
+        self.symbols = symbols
+        self.capital = initial_capital
+        self.initial_capital = initial_capital
+        self.engine = DataEngine(CACHE_DIR)
+        self.positions = []
+        self.history = []
+        self.all_data = {}
+
+    def prepare(self):
+        valid_symbols = []
+        for sym in self.symbols:
+            df = self.engine.get_data(sym, START_DATE, END_DATE)
+            if not df.empty:
+                self.all_data[sym] = df
+                valid_symbols.append(sym)
+        self.symbols = valid_symbols
 
     def run(self):
-        print(f"🚀 Démarrage Backtest Titan {BACKTEST_CONFIG['STRATEGY_VERSION']}")
-        print(f"Intervalle : {BACKTEST_CONFIG['LOOKBACK_DAYS']} jours | Horizon : 3j Drift")
+        if not self.all_data: return
+        timeline = self.all_data[self.symbols[0]].index
         
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=BACKTEST_CONFIG["LOOKBACK_DAYS"])
+        for current_date in timeline:
+            self._update_portfolio(current_date)
+            self._scan_opportunities(current_date)
 
-        for ticker in self.tickers:
-            try:
-                tk = yf.Ticker(ticker)
-                # Récupération des données de prix
-                df = tk.history(start=start_date, end=end_date)
-                if df.empty: continue
-                
-                # Récupération des dates de résultats (Earnings)
-                # Note: yfinance peut être capricieux sur les earnings historiques
-                calendar = tk.get_calendar()
-                if calendar is None or 'Earnings Date' not in calendar:
-                    continue
-                
-                earnings_dates = calendar['Earnings Date']
-                
-                for e_date in earnings_dates:
-                    if not isinstance(e_date, datetime): continue
-                    e_date_str = e_date.strftime('%Y-%m-%d')
-                    
-                    if e_date_str in df.index.strftime('%Y-%m-%d'):
-                        entry_price = df.loc[e_date_str]['Close']
-                        
-                        # Calcul du drift réel à T+3 pour le simulateur IA
-                        future_idx = df.index.get_loc(df.loc[e_date_str].name) + BACKTEST_CONFIG["HOLDING_DAYS"]
-                        if future_idx >= len(df): continue
-                        
-                        exit_price_actual = df.iloc[future_idx]['Close']
-                        actual_drift = (exit_price_actual - entry_price) / entry_price
-                        
-                        # Scoring Grok Sentinel
-                        score, sigma = self.mock_grok_scoring(ticker, e_date_str, actual_drift)
-                        
-                        # Attribution du mode
-                        mode = None
-                        if score >= BACKTEST_CONFIG["MODES"]["EXPLOITATION"]["min_score"] and sigma <= BACKTEST_CONFIG["MODES"]["EXPLOITATION"]["max_sigma"]:
-                            mode = "EXPLOITATION"
-                        elif score >= BACKTEST_CONFIG["MODES"]["EXPLORATION"]["min_score"] and sigma <= BACKTEST_CONFIG["MODES"]["EXPLORATION"]["max_sigma"]:
-                            mode = "EXPLORATION"
-                            
-                        if mode:
-                            self.execute_trade(ticker, entry_price, exit_price_actual, e_date_str, mode, score)
-                            
-            except Exception as e:
-                print(f"⚠️ Erreur sur {ticker}: {e}")
+        self._print_final_report()
 
-        self.generate_report()
+    def _update_portfolio(self, current_date):
+        active_positions = []
+        for pos in self.positions:
+            sym = pos['symbol']
+            if current_date not in self.all_data[sym].index:
+                active_positions.append(pos); continue
 
-    def execute_trade(self, symbol, entry, target_exit, date, mode, score):
-        # Simulation de la gestion des risques
-        risk_per_trade = self.equity * BACKTEST_CONFIG["MAX_POS_SIZE"]
-        qty = risk_per_trade / entry
-        
-        # Vérification TP / SL (Simulation simplifiée sur le prix final)
-        pnl_pct = (target_exit - entry) / entry
-        
-        # Application des barrières de la gouvernance v5.6.11
-        final_pnl_pct = pnl_pct
-        exit_type = "3-DAY-DRIFT"
-        
-        if pnl_pct >= BACKTEST_CONFIG["BASE_TP_PCT"]:
-            final_pnl_pct = BACKTEST_CONFIG["BASE_TP_PCT"]
-            exit_type = "TAKE_PROFIT"
-        elif pnl_pct <= -BACKTEST_CONFIG["BASE_SL_PCT"]:
-            final_pnl_pct = -BACKTEST_CONFIG["BASE_SL_PCT"]
-            exit_type = "STOP_LOSS"
+            day = self.all_data[sym].loc[current_date]
+            exit_price = None
+            reason = ""
+
+            # Logique de sortie STRICTE (TP/SL Bracket)
+            if day['Low'] <= pos['sl']:
+                exit_price = pos['sl']
+                reason = "STOP_LOSS"
+            elif day['High'] >= pos['tp']:
+                exit_price = pos['tp']
+                reason = "TAKE_PROFIT"
+            elif (current_date - pos['entry_date']).days >= GOUVERNANCE["MAX_HOLDING_DAYS"]:
+                exit_price = day['Close']
+                reason = "TIME_EXIT"
+
+            if exit_price:
+                pnl = (exit_price - pos['entry_price']) * pos['qty']
+                self.capital += (exit_price * pos['qty'])
+                self.history.append({'symbol': sym, 'pnl': pnl, 'reason': reason})
+            else:
+                active_positions.append(pos)
+        self.positions = active_positions
+
+    def _scan_opportunities(self, current_date):
+        for sym in self.symbols:
+            if any(p['symbol'] == sym for p in self.positions): continue
             
-        # Application du slippage
-        final_pnl_pct -= BACKTEST_CONFIG["SLIPPAGE"]
-        pnl_usd = (entry * qty) * final_pnl_pct
-        
-        self.history.append({
-            "date": date,
-            "symbol": symbol,
-            "mode": mode,
-            "score": score,
-            "entry": round(entry, 2),
-            "pnl_usd": round(pnl_usd, 2),
-            "pnl_pct": round(final_pnl_pct * 100, 2),
-            "exit_type": exit_type
-        })
-        
-        self.equity += pnl_usd
+            score, sigma = SimulatedBrain.get_ai_score(sym, current_date)
+            
+            # Logique de sélection de mode STRICTE
+            mode = "EXPLOITATION" if score >= 85 and sigma <= 20 else "EXPLORATION" if score >= 72 and sigma <= 35 else None
+            
+            if mode:
+                price = self.all_data[sym].loc[current_date]['Close']
+                risk = GOUVERNANCE["MODES"][mode]["BASE_RISK"]
+                
+                # Calcul de QTY identique à ton code (Audit #1/#2)
+                qty = min(int((self.capital * risk) / (price * GOUVERNANCE["BASE_SL_PCT"])), 
+                          int((self.capital * GOUVERNANCE["MAX_POSITION_SIZE_PCT"]) / price))
 
-    def generate_report(self):
-        df_res = pd.DataFrame(self.history)
-        if df_res.empty:
-            print("❌ Aucun trade exécuté durant la période.")
-            return
+                if qty > 0 and self.capital >= (qty * price):
+                    # Application du slippage de ton code
+                    entry_p = price * (1 + GOUVERNANCE["SLIPPAGE_PROTECTION"])
+                    self.capital -= (entry_p * qty)
+                    self.positions.append({
+                        'symbol': sym, 'entry_date': current_date, 'entry_price': entry_p,
+                        'qty': qty, 'tp': entry_p * (1 + GOUVERNANCE["BASE_TP_PCT"]),
+                        'sl': entry_p * (1 - GOUVERNANCE["BASE_SL_PCT"]), 'mode': mode
+                    })
 
-        total_pnl = df_res['pnl_usd'].sum()
-        win_rate = (df_res['pnl_usd'] > 0).mean() * 100
-        profit_factor = df_res[df_res['pnl_usd'] > 0]['pnl_usd'].sum() / abs(df_res[df_res['pnl_usd'] < 0]['pnl_usd'].sum()) if any(df_res['pnl_usd'] < 0) else np.inf
-        
+    def _print_final_report(self):
+        df_hist = pd.DataFrame(self.history)
+        current_val = self.capital + sum(p['qty'] * self.all_data[p['symbol']].iloc[-1]['Close'] for p in self.positions)
         print("\n" + "="*45)
-        print(f"📊 RAPPORT TITAN v5.6.11-LTS")
+        print(" 🛡️  TITAN 5.6.11 - STRICT LOGIC REPORT")
         print("="*45)
-        print(f"Équité Finale    : ${self.equity:,.2f}")
-        print(f"PnL Total        : ${total_pnl:,.2f} ({((self.equity/BACKTEST_CONFIG['CASH_INITIAL'])-1)*100:.2f}%)")
-        print(f"Win Rate         : {win_rate:.1f}%")
-        print(f"Profit Factor    : {profit_factor:.2f}")
-        print(f"Nombre de Trades : {len(df_res)}")
-        print("-" * 45)
-        print("PERFORMANCE PAR MODE :")
-        for m in ["EXPLOITATION", "EXPLORATION"]:
-            m_df = df_res[df_res['mode'] == m]
-            if not m_df.empty:
-                avg_score = m_df['score'].mean()
-                exp = m_df['pnl_usd'].mean()
-                print(f"[{m}] Trades: {len(m_df)} | Score Avg: {avg_score:.1f} | Expectancy: ${exp:.2f}")
+        print(f"Valeur Finale: ${current_val:,.2f}")
+        print(f"Profit Total : ${current_val - self.initial_capital:,.2f}")
+        if not df_hist.empty:
+            print(f"Win Rate     : {(len(df_hist[df_hist['pnl'] > 0]) / len(df_hist)) * 100:.2f}%")
+            print("\nRépartition des sorties:")
+            print(df_hist['reason'].value_counts())
         print("="*45)
 
 if __name__ == "__main__":
-    # Univers de test réduit pour l'exemple
-    universe = ["AAPL", "NVDA", "TSLA", "MSFT", "AMD", "GOOGL", "META", "NFLX", "JPM", "GS"]
-    
-    backtester = TitanBacktester(universe)
-    backtester.run()
+    tester = TitanBacktester(SYMBOLS_TO_TEST, INITIAL_CAPITAL)
+    tester.prepare()
+    tester.run()
