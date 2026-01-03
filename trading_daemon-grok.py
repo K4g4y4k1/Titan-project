@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import alpaca_trade_api as tradeapi
 
-# --- CONFIGURATION v5.6.11-LTS "GROK-SENTINEL" ---
+# --- CONFIGURATION v5.6.11-LTS "APEX-ULTIMATE: GROK-SENTINEL" ---
 DB_PATH = "titan_prod_v5.db"
 LOG_FILE = "titan_system.log"
 BACKUP_DIR = "backups"
