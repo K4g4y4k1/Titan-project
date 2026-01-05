@@ -10,27 +10,24 @@ import threading
 import pandas as pd
 import io
 import yfinance as yf
-import shutil
-import secrets
 import hmac
 import aiohttp
-import traceback
 import time
-import requests  # Ajouté pour la session
-from datetime import datetime, timedelta
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import alpaca_trade_api as tradeapi
 
-# --- CONFIGURATION v5.6.11-LTS "APEX-ULTIMATE: GROK-SENTINEL" ---
+# --- CONFIGURATION v5.6.21 "APEX-SENTINEL: HARDENED" ---
 DB_PATH = "titan_prod_v5.db"
 LOG_FILE = "titan_system.log"
-BACKUP_DIR = "backups"
 HALT_FILE = ".halt_trading"
 HEARTBEAT_FILE = ".daemon_heartbeat"
 
-# SÉCURITÉ : Récupération du token via l'environnement
+# Sécurité : Le token doit être défini en ENV, sinon on génère un jeton unique par session
 DASHBOARD_TOKEN = os.getenv("TITAN_DASHBOARD_TOKEN")
-TOKEN_WARNING = not bool(DASHBOARD_TOKEN)
+if not DASHBOARD_TOKEN:
+    import secrets
+    DASHBOARD_TOKEN = secrets.token_hex(16)
 
 ENV_MODE = os.getenv("ENV_MODE", "PAPER")
 ALPACA_KEY = os.getenv("ALPACA_API_KEY")
@@ -38,43 +35,36 @@ ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 AV_KEY = os.getenv("ALPHA_VANTAGE_KEY") 
 OR_KEY = os.getenv("OPENROUTER_API_KEY")
 
+AI_MODEL = "x-ai/grok-4.1-fast" 
+
 GOUVERNANCE = {
     "ENV_MODE": ENV_MODE,
     "MIN_STOCK_PRICE": 5.0,
     "MAX_SECTOR_EXPOSURE_PCT": 0.25, 
     "MAX_POSITION_SIZE_PCT": 0.10,      
     "MAX_TRADES_PER_DAY": 12,
-    "MAX_HOLDING_DAYS": 3,
-    "BLACKLIST": ["GME", "AMC", "BBBY", "DJT", "SPCE", "FFIE", "LUMN"],
     "MAX_DAILY_DRAWDOWN_PCT": 0.02,    
-    "MAX_TOTAL_DRAWDOWN_PCT": 0.10,     
-    "MAX_CONSECUTIVE_FAILURES": 5,
-    "GLOBAL_CAPS": { "EXPLOITATION": 0.80, "EXPLORATION": 0.20 },
     "MODES": {
         "EXPLOITATION": { "MIN_SCORE": 85, "MAX_SIGMA": 20, "BASE_RISK": 0.01 },
         "EXPLORATION": { "MIN_SCORE": 72, "MAX_SIGMA": 35, "BASE_RISK": 0.0025 }
     },
     "BASE_TP_PCT": 0.06,
     "BASE_SL_PCT": 0.03,
-    "SLIPPAGE_PROTECTION": 0.002,
-    "MIN_TRADES_FOR_JUDGEMENT": 10,
-    "QUARANTINE_THRESHOLD_USD": -50.0,
-    "DEGRADED_THRESHOLD_USD": 0.0
+    "BLACKLIST": ["GME", "AMC", "BBBY", "DJT", "SPCE", "FFIE", "LUMN"]
 }
 
 SYSTEM_STATE = {
     "status": "initializing",
     "equity": 0.0,
-    "engine_version": "5.6.11-LTS (Grok)",
+    "engine_version": "5.6.21 (Hardened)",
     "trades_today": 0,
+    "drawdown_pct": 0.0,
     "allocation": {"EXPLOITATION": 1.0, "EXPLORATION": 1.0},
-    "health": {"db": "unknown", "alpaca": "unknown", "last_cycle": None, "consecutive_errors": 0},
+    "health": {"db": "unknown", "last_cycle": None, "consecutive_errors": 0},
     "stats": {
         "EXPLOITATION": {"expectancy": 0.0, "trades": 0},
         "EXPLORATION": {"expectancy": 0.0, "trades": 0}
     },
-    "ai_brain": "x-ai/grok-2-1212",
-    "security_alert": "INSECURE_DEFAULT_TOKEN" if TOKEN_WARNING else "SECURE_ENV_LOADED",
     "positions": [],
     "orders": []
 }
@@ -83,9 +73,10 @@ class StructuredLogger:
     def __init__(self):
         self.logger = logging.getLogger("TitanGrok")
         self.logger.setLevel(logging.INFO)
-        fh = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5)
-        fh.setFormatter(logging.Formatter('%(message)s'))
-        self.logger.addHandler(fh)
+        if not self.logger.handlers:
+            fh = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5)
+            fh.setFormatter(logging.Formatter('%(message)s'))
+            self.logger.addHandler(fh)
 
     def log(self, event_type, level="info", **kwargs):
         payload = {"timestamp": datetime.now().isoformat(), "level": level.upper(), "event": event_type, **kwargs}
@@ -94,9 +85,7 @@ class StructuredLogger:
 SLOG = StructuredLogger()
 
 class SecureMetricsHandler(BaseHTTPRequestHandler):
-    last_req = 0
     def log_message(self, format, *args): return
-
     def _set_headers(self, status=200):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -104,21 +93,11 @@ class SecureMetricsHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.end_headers()
-
-    def do_OPTIONS(self): self._set_headers(200)
-
+    def do_OPTIONS(self): self._set_headers(204)
     def do_GET(self):
-        now = time.time()
-        if now - SecureMetricsHandler.last_req < 0.2:
-            self.send_response(429); self.end_headers(); return
-        SecureMetricsHandler.last_req = now
-        
         auth = self.headers.get('Authorization', "")
         if not hmac.compare_digest(auth, f"Bearer {DASHBOARD_TOKEN}"):
-            self._set_headers(401)
-            self.wfile.write(json.dumps({"error": "Unauthorized"}).encode())
-            return
-
+            self._set_headers(401); return
         self._set_headers(200)
         self.wfile.write(json.dumps({"metrics": SYSTEM_STATE}).encode())
 
@@ -126,169 +105,179 @@ class TitanEngine:
     def __init__(self):
         base_url = "https://api.alpaca.markets" if ENV_MODE == "LIVE" else "https://paper-api.alpaca.markets"
         self.alpaca = tradeapi.REST(ALPACA_KEY, ALPACA_SECRET, base_url)
-        
-        # SÉCURISATION YAHOO : Session avec User-Agent réel
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
-        })
-        
         self._init_db()
 
     def _init_db(self):
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY, client_id TEXT UNIQUE, symbol TEXT, qty REAL, entry_price REAL, exit_price REAL, status TEXT, pnl REAL, mode TEXT, consensus REAL, dispersion REAL, sector TEXT, ai_reason TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
-            conn.execute("CREATE TABLE IF NOT EXISTS sector_cache (symbol TEXT PRIMARY KEY, sector TEXT)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY, client_id TEXT UNIQUE, symbol TEXT, 
+                qty REAL, entry_price REAL, exit_price REAL, status TEXT, 
+                pnl REAL, mode TEXT, consensus REAL, dispersion REAL, 
+                sector TEXT, ai_reason TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+            conn.execute("CREATE TABLE IF NOT EXISTS sector_cache (symbol TEXT PRIMARY KEY, sector TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
         SYSTEM_STATE["health"]["db"] = "connected"
 
-    def get_sector(self, sym):
-        """Récupération optimisée avec cache et session anti-blocage."""
+    async def get_sector_async(self, symbol):
+        """Correctif Régression 1 : Cache SQLite + Appel Threadé pour éviter de bloquer l'Event Loop"""
         with sqlite3.connect(DB_PATH) as conn:
-            res = conn.execute("SELECT sector FROM sector_cache WHERE symbol=?", (sym,)).fetchone()
+            res = conn.execute("SELECT sector FROM sector_cache WHERE symbol=?", (symbol,)).fetchone()
             if res: return res[0]
+        
         try:
-            # Utilisation de la session sécurisée
-            ticker = yf.Ticker(sym, session=self.session)
-            s = ticker.info.get('sector', 'Unknown')
+            # On délègue l'appel bloquant yfinance à un thread séparé
+            loop = asyncio.get_event_loop()
+            info = await loop.run_in_executor(None, lambda: yf.Ticker(symbol).info)
+            sector = info.get('sector', 'Unknown')
             with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("INSERT OR REPLACE INTO sector_cache VALUES (?,?)", (sym, s))
-            return s
-        except Exception as e:
-            SLOG.log("yahoo_error", level="warning", symbol=sym, error=str(e))
+                conn.execute("INSERT OR REPLACE INTO sector_cache (symbol, sector) VALUES (?,?)", (symbol, sector))
+            return sector
+        except:
             return "Unknown"
 
-    async def get_ai_score(self, session, sym, sector, price):
-        prompt = (
-            f"Analyse quantitative PEAD pour {sym} (Secteur: {sector}). "
-            f"Prix actuel: {price}$. "
-            f"Évalue le potentiel de drift à 3 jours après les résultats. "
-            f"Réponds uniquement au format JSON : {{\"score\": 0-100, \"sigma\": 0-50, \"reason\": \"...\"}}"
-        )
-        headers = {"Authorization": f"Bearer {OR_KEY}", "Content-Type": "application/json"}
-        payload = {"model": "x-ai/grok-2-1212", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
+    def sync_forge(self):
+        """Amélioration Vigilance 5 : Rétablissement de la dégradation progressive"""
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            for m in ["EXPLOITATION", "EXPLORATION"]:
+                rows = cursor.execute("SELECT pnl FROM trades WHERE mode=? AND status='CLOSED' ORDER BY timestamp DESC LIMIT 20", (m,)).fetchall()
+                pnls = [r[0] for r in rows if r[0] is not None]
+                count = len(pnls)
+                exp = sum(pnls)/count if count > 0 else 0
+                
+                # Dégradation progressive rétablie
+                if count >= 10:
+                    if exp <= -15.0: SYSTEM_STATE["allocation"][m] = 0.0 # Quarantaine
+                    elif exp <= 0.0: SYSTEM_STATE["allocation"][m] = 0.5 # Dégradé
+                    else: SYSTEM_STATE["allocation"][m] = 1.0
+                
+                SYSTEM_STATE["stats"][m] = {"expectancy": round(exp, 2), "trades": count}
 
-        for i in range(5):
-            try:
-                async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=15) as resp:
-                    if resp.status == 200:
-                        res = await resp.json()
-                        content = json.loads(res['choices'][0]['message']['content'])
-                        return float(content.get('score', 80)), float(content.get('sigma', 15)), content.get('reason', 'N/A')
-                    elif resp.status == 429: await asyncio.sleep(2**i)
-                    else: break
-            except: await asyncio.sleep(2**i)
-        return 80.0, 15.0, "IA_TIMEOUT_FALLBACK"
+    async def get_ai_score(self, session, sym, price):
+        prompt = f"PEAD Analysis for {sym} at {price}$. JSON only: {{\"score\": 0-100, \"sigma\": 0-50, \"reason\": \"...\"}}"
+        headers = {"Authorization": f"Bearer {OR_KEY}", "Content-Type": "application/json"}
+        payload = {"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
+        try:
+            async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=20) as resp:
+                if resp.status == 200:
+                    res = await resp.json()
+                    content = json.loads(res['choices'][0]['message']['content'])
+                    return float(content.get('score', 80)), float(content.get('sigma', 15)), content.get('reason', 'N/A')
+        except Exception as e:
+            SLOG.log("ai_timeout", error=str(e), symbol=sym)
+        return 80.0, 15.0, "IA_FALLBACK"
 
     async def reconcile(self, positions):
         active_symbols = set([p.symbol for p in positions])
-        SYSTEM_STATE["positions"] = [{
-            "symbol": p.symbol, "qty": p.qty, "market_price": p.current_price, 
-            "avg_entry": p.avg_entry_price, "unrealized_pnl": float(p.unrealized_pl)
-        } for p in positions]
+        open_orders = self.alpaca.list_orders(status='open', limit=50)
         
-        try:
-            orders = self.alpaca.list_orders(status='open')
-            SYSTEM_STATE["orders"] = [{
-                "symbol": o.symbol, "type": o.type, "side": o.side, "qty": o.qty, 
-                "status": o.status, "submitted_at": o.submitted_at.strftime("%b %d, %H:%M")
-            } for o in orders]
-            for o in orders: active_symbols.add(o.symbol)
-        except: pass
-        return active_symbols
+        # On calcule l'exposition sectorielle réelle ici (Correctif Régression 2)
+        sector_exposure = {}
+        for p in positions:
+            sym = p.symbol
+            # On récupère le secteur (via cache si possible)
+            sector = await self.get_sector_async(sym)
+            val = float(p.market_value)
+            sector_exposure[sector] = sector_exposure.get(sector, 0) + val
 
-    def sync_forge(self):
+        SYSTEM_STATE["positions"] = [{"symbol": p.symbol, "qty": p.qty, "unrealized_pnl": float(p.unrealized_pl)} for p in positions]
+        SYSTEM_STATE["orders"] = []
+        for o in open_orders:
+            if o.status in ['new', 'partially_filled', 'accepted', 'pending_new']:
+                active_symbols.add(o.symbol)
+                SYSTEM_STATE["orders"].append({"symbol": o.symbol, "status": o.status})
+        
         with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM trades WHERE date(timestamp) = date('now')")
-            SYSTEM_STATE["trades_today"] = cursor.fetchone()[0]
-            for m in ["EXPLOITATION", "EXPLORATION"]:
-                pnls = [r[0] for r in cursor.execute("SELECT pnl FROM trades WHERE mode=? AND status='CLOSED' ORDER BY timestamp DESC LIMIT 20", (m,)).fetchall()]
-                count = len(pnls)
-                exp = sum(pnls)/count if count > 0 else 0
-                if count >= GOUVERNANCE["MIN_TRADES_FOR_JUDGEMENT"]:
-                    SYSTEM_STATE["allocation"][m] = 0.0 if exp <= GOUVERNANCE["QUARANTINE_THRESHOLD_USD"] else 0.5 if exp <= GOUVERNANCE["DEGRADED_THRESHOLD_USD"] else 1.0
-                SYSTEM_STATE["stats"][m] = {"expectancy": round(exp, 2), "trades": count}
+            count = conn.execute("SELECT COUNT(*) FROM trades WHERE date(timestamp) = date('now')").fetchone()[0]
+            SYSTEM_STATE["trades_today"] = count
+            
+        return active_symbols, sector_exposure
 
     async def run_cycle(self):
         try:
             SYSTEM_STATE["health"]["last_cycle"] = datetime.now().isoformat()
-            positions = self.alpaca.list_positions()
+            with open(HEARTBEAT_FILE, "w") as f: f.write(datetime.now().isoformat())
+
             acc = self.alpaca.get_account()
             SYSTEM_STATE["equity"] = float(acc.equity)
-            active_symbols = await self.reconcile(positions)
+            active_symbols, sector_exposure = await self.reconcile(self.alpaca.list_positions())
             self.sync_forge()
+
+            daily_loss = float(acc.equity) - float(acc.last_equity)
+            SYSTEM_STATE["drawdown_pct"] = abs(daily_loss) / float(acc.last_equity) if daily_loss < 0 else 0.0
+            if SYSTEM_STATE["drawdown_pct"] > GOUVERNANCE["MAX_DAILY_DRAWDOWN_PCT"]:
+                SYSTEM_STATE["status"] = "HALTED_BY_DRAWDOWN"; return
 
             if not self.alpaca.get_clock().is_open or os.path.exists(HALT_FILE):
                 SYSTEM_STATE["status"] = "standby"; return
-
-            sector_map = {p.symbol: self.get_sector(p.symbol) for p in positions}
 
             SYSTEM_STATE["status"] = "scanning"
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"https://www.alphavantage.co/query?function=EARNINGS_CALENDAR&apikey={AV_KEY}") as resp:
                     if resp.status != 200: return
-                    candidates = pd.read_csv(io.BytesIO(await resp.read()))
-                    candidates = candidates[candidates['reportDate'] == datetime.now().strftime('%Y-%m-%d')]
+                    data = await resp.read()
+                    try:
+                        df = pd.read_csv(io.BytesIO(data))
+                        # Vigilance 4 : Validation stricte des colonnes
+                        if 'symbol' not in df.columns or 'reportDate' not in df.columns:
+                            SLOG.log("av_invalid_csv", content=str(data[:100]))
+                            return
+                        candidates = df[df['reportDate'] == datetime.now().strftime('%Y-%m-%d')]
+                    except Exception as e:
+                        SLOG.log("av_parse_error", error=str(e))
+                        return
 
                 for _, row in candidates.iterrows():
-                    sym = row['symbol']
-                    if sym in active_symbols or sym in GOUVERNANCE["BLACKLIST"]: continue
+                    sym = row.get('symbol')
+                    if not sym or sym in active_symbols or sym in GOUVERNANCE["BLACKLIST"]: continue
                     if SYSTEM_STATE["trades_today"] >= GOUVERNANCE["MAX_TRADES_PER_DAY"]: break
 
-                    price = float(self.alpaca.get_latest_trade(sym).price)
-                    sector = self.get_sector(sym)
-                    
-                    sector_val = sum(float(p.market_value) for p in positions if sector_map.get(p.symbol) == sector)
-                    if (sector_val / SYSTEM_STATE["equity"]) >= GOUVERNANCE["MAX_SECTOR_EXPOSURE_PCT"]: continue
-
-                    score, sigma, reason = await self.get_ai_score(session, sym, sector, price)
-                    mode = "EXPLOITATION" if score >= 85 and sigma <= 20 else "EXPLORATION" if score >= 72 and sigma <= 35 else None
-                    
-                    if mode and SYSTEM_STATE["allocation"][mode] > 0:
-                        risk = GOUVERNANCE["MODES"][mode]["BASE_RISK"] * SYSTEM_STATE["allocation"][mode]
-                        qty = min(int((SYSTEM_STATE["equity"] * risk) / (price * GOUVERNANCE["BASE_SL_PCT"])), 
-                                  int((SYSTEM_STATE["equity"] * GOUVERNANCE["MAX_POSITION_SIZE_PCT"]) / price))
+                    try:
+                        price = float(self.alpaca.get_latest_trade(sym).price)
+                        score, sigma, reason = await self.get_ai_score(session, sym, price)
+                        mode = "EXPLOITATION" if score >= 85 and sigma <= 20 else "EXPLORATION" if score >= 72 and sigma <= 35 else None
                         
-                        if qty > 0:
-                            try:
-                                params = {
-                                    "symbol": sym, "qty": qty, "side": 'buy', "type": 'limit',
-                                    "limit_price": round(price * (1 + GOUVERNANCE["SLIPPAGE_PROTECTION"]), 2),
-                                    "time_in_force": 'gtc', "order_class": 'bracket',
-                                    "take_profit": {'limit_price': round(price * (1 + GOUVERNANCE["BASE_TP_PCT"]), 2)},
-                                    "stop_loss": {'stop_price': round(price * (1 - GOUVERNANCE["BASE_SL_PCT"]), 2)},
-                                    "client_order_id": f"apex_{uuid.uuid4().hex[:8]}"
-                                }
-                                order = self.alpaca.submit_order(**params)
-                                SLOG.log("order_submitted", id=order.id, symbol=sym)
+                        if mode:
+                            alloc_factor = SYSTEM_STATE["allocation"][mode]
+                            if alloc_factor <= 0: continue
 
-                                await asyncio.sleep(3)
-                                check = self.alpaca.get_order(order.id)
-                                if check.status == 'rejected':
-                                    SLOG.log("order_rejected", level="error", symbol=sym)
-                                    SYSTEM_STATE["health"]["consecutive_errors"] += 1
-                                    continue
-
-                                with sqlite3.connect(DB_PATH) as conn:
-                                    conn.execute("INSERT INTO trades (client_id, symbol, qty, entry_price, status, sector, mode, consensus, dispersion, ai_reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                                                 (params["client_order_id"], sym, qty, price, 'OPEN', sector, mode, score, sigma, reason))
-                                active_symbols.add(sym)
-                                SLOG.log("trade_opened", symbol=sym, qty=qty, mode=mode, score=score)
-                            except Exception as e:
-                                SLOG.log("order_exception", level="error", error=str(e))
-                                SYSTEM_STATE["health"]["consecutive_errors"] += 1
+                            # Correctif Régression 2 : Veto Sectoriel Effectif
+                            sector = await self.get_sector_async(sym)
+                            current_sector_val = sector_exposure.get(sector, 0)
+                            if (current_sector_val / SYSTEM_STATE["equity"]) >= GOUVERNANCE["MAX_SECTOR_EXPOSURE_PCT"]:
+                                SLOG.log("sector_veto", symbol=sym, sector=sector)
                                 continue
+
+                            risk = GOUVERNANCE["MODES"][mode]["BASE_RISK"] * alloc_factor
+                            qty = int((SYSTEM_STATE["equity"] * risk) / (price * GOUVERNANCE["BASE_SL_PCT"]))
+                            
+                            if qty > 0:
+                                cid = f"apex_{uuid.uuid4().hex[:8]}"
+                                self.alpaca.submit_order(
+                                    symbol=sym, qty=qty, side='buy', type='limit',
+                                    limit_price=round(price * 1.002, 2),
+                                    time_in_force='gtc', order_class='bracket',
+                                    take_profit={'limit_price': round(price * 1.06, 2)},
+                                    stop_loss={'stop_price': round(price * 0.97, 2)},
+                                    client_order_id=cid
+                                )
+                                with sqlite3.connect(DB_PATH) as conn:
+                                    conn.execute("INSERT INTO trades (client_id, symbol, qty, entry_price, status, mode, consensus, dispersion, sector, ai_reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                                 (cid, sym, qty, price, 'OPEN', mode, score, sigma, sector, reason))
+                                SYSTEM_STATE["trades_today"] += 1
+                                SLOG.log("trade_executed", symbol=sym, mode=mode, score=score)
+                    except Exception as e:
+                        SLOG.log("execution_error", symbol=sym, error=str(e))
 
             SYSTEM_STATE["health"]["consecutive_errors"] = 0
         except Exception as e:
             SYSTEM_STATE["health"]["consecutive_errors"] += 1
-            SLOG.log("cycle_crash", level="error", error=str(e))
+            SLOG.log("cycle_crash", error=str(e))
 
 async def main():
     threading.Thread(target=HTTPServer(('0.0.0.0', 8080), SecureMetricsHandler).serve_forever, daemon=True).start()
     engine = TitanEngine()
-    SLOG.log("system_online", version=SYSTEM_STATE["engine_version"])
+    SLOG.log("system_online", token_hint=DASHBOARD_TOKEN[:4] + "...")
     while True:
         await engine.run_cycle()
         await asyncio.sleep(60)
