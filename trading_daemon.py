@@ -17,7 +17,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import alpaca_trade_api as tradeapi
 
-# --- CONFIGURATION v5.6.21 "APEX-SENTINEL: HARDENED" ---
+# --- CONFIGURATION v5.6.21 "APEX-ULTIMATE: HARDENED" ---
 DB_PATH = "titan_prod_v5.db"
 LOG_FILE = "titan_system.log"
 HALT_FILE = ".halt_trading"
