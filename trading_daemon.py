@@ -17,13 +17,12 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import alpaca_trade_api as tradeapi
 
-# --- CONFIGURATION v5.6.21 "APEX-ULTIMATE: HARDENED" ---
+# --- CONFIGURATION v5.7.0 "APEX-AUDITABLE" ---
 DB_PATH = "titan_prod_v5.db"
 LOG_FILE = "titan_system.log"
 HALT_FILE = ".halt_trading"
 HEARTBEAT_FILE = ".daemon_heartbeat"
 
-# Sécurité : Le token doit être défini en ENV, sinon on génère un jeton unique par session
 DASHBOARD_TOKEN = os.getenv("TITAN_DASHBOARD_TOKEN")
 if not DASHBOARD_TOKEN:
     import secrets
@@ -53,10 +52,45 @@ GOUVERNANCE = {
     "BLACKLIST": ["GME", "AMC", "BBBY", "DJT", "SPCE", "FFIE", "LUMN"]
 }
 
+# 🆕 CADRE DE RAISONNEMENT IA IMPOSÉ
+AI_REASONING_FRAMEWORK = """You are an earnings drift analyst. Evaluate ONLY these dimensions:
+
+1. **Earnings Surprise Magnitude** (-2 to +2): How large vs estimates?
+2. **Revenue Surprise Direction** (-, 0, +): Beat/miss/inline?
+3. **Guidance Change** (-, 0, +): Raised/lowered/unchanged?
+4. **Gap Direction** (-, 0, +): Pre-market gap vs prior close?
+5. **Volume Abnormality** (0-10): Unusual activity level?
+6. **Liquidity/Float** (small/medium/large): Can we exit cleanly?
+7. **Market Regime** (risk-on/risk-off/neutral): Broad sentiment?
+
+For each dimension:
+- Give your assessment (+/0/-)
+- Justify briefly (max 15 words)
+
+Then synthesize into:
+{
+  "score": 0-100,
+  "sigma": 0-50,
+  "dimensions": {
+    "earnings_surprise": {"rating": "+/-/0", "note": "..."},
+    "revenue_surprise": {"rating": "+/-/0", "note": "..."},
+    "guidance": {"rating": "+/-/0", "note": "..."},
+    "gap_direction": {"rating": "+/-/0", "note": "..."},
+    "volume": {"rating": "0-10", "note": "..."},
+    "liquidity": {"rating": "small/medium/large", "note": "..."},
+    "market_regime": {"rating": "risk-on/risk-off/neutral", "note": "..."}
+  },
+  "assumptions": ["key assumption 1", "key assumption 2"],
+  "invalidations": ["what would prove this wrong"],
+  "reason": "concise 1-sentence synthesis"
+}
+
+JSON ONLY. NO MARKDOWN."""
+
 SYSTEM_STATE = {
     "status": "initializing",
     "equity": 0.0,
-    "engine_version": "5.6.21 (Hardened)",
+    "engine_version": "5.7.0 (Auditable)",
     "trades_today": 0,
     "drawdown_pct": 0.0,
     "allocation": {"EXPLOITATION": 1.0, "EXPLORATION": 1.0},
@@ -110,22 +144,38 @@ class TitanEngine:
     def _init_db(self):
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
+            # Table principale (inchangée)
             conn.execute("""CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY, client_id TEXT UNIQUE, symbol TEXT, 
                 qty REAL, entry_price REAL, exit_price REAL, status TEXT, 
                 pnl REAL, mode TEXT, consensus REAL, dispersion REAL, 
                 sector TEXT, ai_reason TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+            
+            # 🆕 NOUVELLE TABLE : AI_AUDIT
+            conn.execute("""CREATE TABLE IF NOT EXISTS ai_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                score REAL,
+                sigma REAL,
+                dimensions TEXT,
+                assumptions TEXT,
+                invalidations TEXT,
+                reason TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(client_id) REFERENCES trades(client_id)
+            )""")
+            
             conn.execute("CREATE TABLE IF NOT EXISTS sector_cache (symbol TEXT PRIMARY KEY, sector TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
         SYSTEM_STATE["health"]["db"] = "connected"
 
     async def get_sector_async(self, symbol):
-        """Correctif Régression 1 : Cache SQLite + Appel Threadé pour éviter de bloquer l'Event Loop"""
+        """Cache SQLite + Appel Threadé pour éviter de bloquer l'Event Loop"""
         with sqlite3.connect(DB_PATH) as conn:
             res = conn.execute("SELECT sector FROM sector_cache WHERE symbol=?", (symbol,)).fetchone()
             if res: return res[0]
         
         try:
-            # On délègue l'appel bloquant yfinance à un thread séparé
             loop = asyncio.get_event_loop()
             info = await loop.run_in_executor(None, lambda: yf.Ticker(symbol).info)
             sector = info.get('sector', 'Unknown')
@@ -136,7 +186,7 @@ class TitanEngine:
             return "Unknown"
 
     def sync_forge(self):
-        """Amélioration Vigilance 5 : Rétablissement de la dégradation progressive"""
+        """Dégradation progressive basée sur expectancy"""
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             for m in ["EXPLOITATION", "EXPLORATION"]:
@@ -145,37 +195,63 @@ class TitanEngine:
                 count = len(pnls)
                 exp = sum(pnls)/count if count > 0 else 0
                 
-                # Dégradation progressive rétablie
                 if count >= 10:
-                    if exp <= -15.0: SYSTEM_STATE["allocation"][m] = 0.0 # Quarantaine
-                    elif exp <= 0.0: SYSTEM_STATE["allocation"][m] = 0.5 # Dégradé
+                    if exp <= -15.0: SYSTEM_STATE["allocation"][m] = 0.0
+                    elif exp <= 0.0: SYSTEM_STATE["allocation"][m] = 0.5
                     else: SYSTEM_STATE["allocation"][m] = 1.0
                 
                 SYSTEM_STATE["stats"][m] = {"expectancy": round(exp, 2), "trades": count}
 
     async def get_ai_score(self, session, sym, price):
-        prompt = f"PEAD Analysis for {sym} at {price}$. JSON only: {{\"score\": 0-100, \"sigma\": 0-50, \"reason\": \"...\"}}"
+        """🆕 FONCTION REFACTORISÉE : Retourne maintenant un dictionnaire complet"""
+        prompt = f"""Symbol: {sym}
+Current Price: ${price}
+
+{AI_REASONING_FRAMEWORK}"""
+
         headers = {"Authorization": f"Bearer {OR_KEY}", "Content-Type": "application/json"}
-        payload = {"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
+        payload = {
+            "model": AI_MODEL, 
+            "messages": [{"role": "user", "content": prompt}], 
+            "response_format": {"type": "json_object"}
+        }
+        
         try:
-            async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=20) as resp:
+            async with session.post("https://openrouter.ai/api/v1/chat/completions", 
+                                   headers=headers, json=payload, timeout=25) as resp:
                 if resp.status == 200:
                     res = await resp.json()
                     content = json.loads(res['choices'][0]['message']['content'])
-                    return float(content.get('score', 80)), float(content.get('sigma', 15)), content.get('reason', 'N/A')
+                    
+                    # 🆕 EXTRACTION STRUCTURÉE
+                    return {
+                        "score": float(content.get('score', 80)),
+                        "sigma": float(content.get('sigma', 15)),
+                        "dimensions": content.get('dimensions', {}),
+                        "assumptions": content.get('assumptions', []),
+                        "invalidations": content.get('invalidations', []),
+                        "reason": content.get('reason', 'N/A')
+                    }
         except Exception as e:
             SLOG.log("ai_timeout", error=str(e), symbol=sym)
-        return 80.0, 15.0, "IA_FALLBACK"
+        
+        # Fallback propre
+        return {
+            "score": 80.0,
+            "sigma": 15.0,
+            "dimensions": {},
+            "assumptions": ["IA_FALLBACK"],
+            "invalidations": ["IA_FALLBACK"],
+            "reason": "IA_TIMEOUT_OR_ERROR"
+        }
 
     async def reconcile(self, positions):
         active_symbols = set([p.symbol for p in positions])
         open_orders = self.alpaca.list_orders(status='open', limit=50)
         
-        # On calcule l'exposition sectorielle réelle ici (Correctif Régression 2)
         sector_exposure = {}
         for p in positions:
             sym = p.symbol
-            # On récupère le secteur (via cache si possible)
             sector = await self.get_sector_async(sym)
             val = float(p.market_value)
             sector_exposure[sector] = sector_exposure.get(sector, 0) + val
@@ -218,7 +294,6 @@ class TitanEngine:
                     data = await resp.read()
                     try:
                         df = pd.read_csv(io.BytesIO(data))
-                        # Vigilance 4 : Validation stricte des colonnes
                         if 'symbol' not in df.columns or 'reportDate' not in df.columns:
                             SLOG.log("av_invalid_csv", content=str(data[:100]))
                             return
@@ -234,14 +309,18 @@ class TitanEngine:
 
                     try:
                         price = float(self.alpaca.get_latest_trade(sym).price)
-                        score, sigma, reason = await self.get_ai_score(session, sym, price)
+                        
+                        # 🆕 ANALYSE IA ENRICHIE
+                        ai_analysis = await self.get_ai_score(session, sym, price)
+                        score = ai_analysis["score"]
+                        sigma = ai_analysis["sigma"]
+                        
                         mode = "EXPLOITATION" if score >= 85 and sigma <= 20 else "EXPLORATION" if score >= 72 and sigma <= 35 else None
                         
                         if mode:
                             alloc_factor = SYSTEM_STATE["allocation"][mode]
                             if alloc_factor <= 0: continue
 
-                            # Correctif Régression 2 : Veto Sectoriel Effectif
                             sector = await self.get_sector_async(sym)
                             current_sector_val = sector_exposure.get(sector, 0)
                             if (current_sector_val / SYSTEM_STATE["equity"]) >= GOUVERNANCE["MAX_SECTOR_EXPOSURE_PCT"]:
@@ -261,11 +340,28 @@ class TitanEngine:
                                     stop_loss={'stop_price': round(price * 0.97, 2)},
                                     client_order_id=cid
                                 )
+                                
+                                # 🆕 DOUBLE ÉCRITURE : trades + ai_audit
                                 with sqlite3.connect(DB_PATH) as conn:
-                                    conn.execute("INSERT INTO trades (client_id, symbol, qty, entry_price, status, mode, consensus, dispersion, sector, ai_reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                                                 (cid, sym, qty, price, 'OPEN', mode, score, sigma, sector, reason))
+                                    # Table trades (format legacy conservé)
+                                    conn.execute("""INSERT INTO trades 
+                                        (client_id, symbol, qty, entry_price, status, mode, consensus, dispersion, sector, ai_reason) 
+                                        VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                                        (cid, sym, qty, price, 'OPEN', mode, score, sigma, sector, ai_analysis["reason"]))
+                                    
+                                    # 🆕 Table ai_audit (détails complets)
+                                    conn.execute("""INSERT INTO ai_audit 
+                                        (client_id, symbol, score, sigma, dimensions, assumptions, invalidations, reason) 
+                                        VALUES (?,?,?,?,?,?,?,?)""",
+                                        (cid, sym, score, sigma, 
+                                         json.dumps(ai_analysis["dimensions"]),
+                                         json.dumps(ai_analysis["assumptions"]),
+                                         json.dumps(ai_analysis["invalidations"]),
+                                         ai_analysis["reason"]))
+                                
                                 SYSTEM_STATE["trades_today"] += 1
-                                SLOG.log("trade_executed", symbol=sym, mode=mode, score=score)
+                                SLOG.log("trade_executed", symbol=sym, mode=mode, score=score, 
+                                        assumptions=ai_analysis["assumptions"])
                     except Exception as e:
                         SLOG.log("execution_error", symbol=sym, error=str(e))
 
@@ -277,7 +373,7 @@ class TitanEngine:
 async def main():
     threading.Thread(target=HTTPServer(('0.0.0.0', 8080), SecureMetricsHandler).serve_forever, daemon=True).start()
     engine = TitanEngine()
-    SLOG.log("system_online", token_hint=DASHBOARD_TOKEN[:4] + "...")
+    SLOG.log("system_online", token_hint=DASHBOARD_TOKEN[:4] + "...", version="5.7.0-Auditable")
     while True:
         await engine.run_cycle()
         await asyncio.sleep(60)
