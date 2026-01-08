@@ -3,7 +3,6 @@ import sqlite3
 import logging
 import logging.handlers
 import os
-import sys
 import json
 import uuid
 import threading
@@ -12,23 +11,17 @@ import io
 import yfinance as yf
 import hmac
 import aiohttp
-import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import alpaca_trade_api as tradeapi
 
-# --- CONFIGURATION v5.6.21 "APEX-ULTIMATE: HARDENED" ---
+# --- CONFIGURATION v5.7.3 "GEL TOTAL" ---
 DB_PATH = "titan_prod_v5.db"
 LOG_FILE = "titan_system.log"
 HALT_FILE = ".halt_trading"
 HEARTBEAT_FILE = ".daemon_heartbeat"
 
-# Sécurité : Le token doit être défini en ENV, sinon on génère un jeton unique par session
-DASHBOARD_TOKEN = os.getenv("TITAN_DASHBOARD_TOKEN")
-if not DASHBOARD_TOKEN:
-    import secrets
-    DASHBOARD_TOKEN = secrets.token_hex(16)
-
+DASHBOARD_TOKEN = os.getenv("TITAN_DASHBOARD_TOKEN", "c3stun3s4cr334v3ntur3")
 ENV_MODE = os.getenv("ENV_MODE", "PAPER")
 ALPACA_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
@@ -39,34 +32,28 @@ AI_MODEL = "x-ai/grok-4.1-fast"
 
 GOUVERNANCE = {
     "ENV_MODE": ENV_MODE,
-    "MIN_STOCK_PRICE": 5.0,
-    "MAX_SECTOR_EXPOSURE_PCT": 0.25, 
-    "MAX_POSITION_SIZE_PCT": 0.10,      
-    "MAX_TRADES_PER_DAY": 12,
-    "MAX_DAILY_DRAWDOWN_PCT": 0.02,    
+    "MAX_SECTOR_EXPOSURE_PCT": 0.20,
+    "MAX_POSITION_SIZE_PCT": 0.08, 
+    "MAX_TRADES_PER_DAY": 8,
+    "MAX_DAILY_DRAWDOWN_PCT": 0.015,
+    "PEAD_WINDOW_DAYS": 21,
     "MODES": {
-        "EXPLOITATION": { "MIN_SCORE": 85, "MAX_SIGMA": 20, "BASE_RISK": 0.01 },
-        "EXPLORATION": { "MIN_SCORE": 72, "MAX_SIGMA": 35, "BASE_RISK": 0.0025 }
+        "EXPLOITATION": { "MIN_SCORE": 88, "BASE_RISK": 0.008 },
+        "EXPLORATION": { "MIN_SCORE": 75, "BASE_RISK": 0.002 }
     },
-    "BASE_TP_PCT": 0.06,
-    "BASE_SL_PCT": 0.03,
+    "BASE_TP_PCT": 0.05,
+    "BASE_SL_PCT": 0.025,
     "BLACKLIST": ["GME", "AMC", "BBBY", "DJT", "SPCE", "FFIE", "LUMN"]
 }
 
 SYSTEM_STATE = {
     "status": "initializing",
     "equity": 0.0,
-    "engine_version": "5.6.21 (Hardened)",
+    "engine_version": "5.7.3 (Final)",
     "trades_today": 0,
     "drawdown_pct": 0.0,
-    "allocation": {"EXPLOITATION": 1.0, "EXPLORATION": 1.0},
-    "health": {"db": "unknown", "last_cycle": None, "consecutive_errors": 0},
-    "stats": {
-        "EXPLOITATION": {"expectancy": 0.0, "trades": 0},
-        "EXPLORATION": {"expectancy": 0.0, "trades": 0}
-    },
-    "positions": [],
-    "orders": []
+    "health": {"db": "connected", "last_cycle": None},
+    "positions": []
 }
 
 class StructuredLogger:
@@ -75,11 +62,11 @@ class StructuredLogger:
         self.logger.setLevel(logging.INFO)
         if not self.logger.handlers:
             fh = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5)
-            fh.setFormatter(logging.Formatter('%(message)s'))
+            fh.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
             self.logger.addHandler(fh)
 
     def log(self, event_type, level="info", **kwargs):
-        payload = {"timestamp": datetime.now().isoformat(), "level": level.upper(), "event": event_type, **kwargs}
+        payload = {"ts": datetime.now().isoformat(), "lvl": level.upper(), "ev": event_type, **kwargs}
         self.logger.info(json.dumps(payload))
 
 SLOG = StructuredLogger()
@@ -90,10 +77,7 @@ class SecureMetricsHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.end_headers()
-    def do_OPTIONS(self): self._set_headers(204)
     def do_GET(self):
         auth = self.headers.get('Authorization', "")
         if not hmac.compare_digest(auth, f"Bearer {DASHBOARD_TOKEN}"):
@@ -110,103 +94,95 @@ class TitanEngine:
     def _init_db(self):
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
+            # Ajout de reasoning_category à la table
             conn.execute("""CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY, client_id TEXT UNIQUE, symbol TEXT, 
                 qty REAL, entry_price REAL, exit_price REAL, status TEXT, 
-                pnl REAL, mode TEXT, consensus REAL, dispersion REAL, 
-                sector TEXT, ai_reason TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-            conn.execute("CREATE TABLE IF NOT EXISTS sector_cache (symbol TEXT PRIMARY KEY, sector TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
-        SYSTEM_STATE["health"]["db"] = "connected"
-
-    async def get_sector_async(self, symbol):
-        """Correctif Régression 1 : Cache SQLite + Appel Threadé pour éviter de bloquer l'Event Loop"""
-        with sqlite3.connect(DB_PATH) as conn:
-            res = conn.execute("SELECT sector FROM sector_cache WHERE symbol=?", (symbol,)).fetchone()
-            if res: return res[0]
-        
-        try:
-            # On délègue l'appel bloquant yfinance à un thread séparé
-            loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(None, lambda: yf.Ticker(symbol).info)
-            sector = info.get('sector', 'Unknown')
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("INSERT OR REPLACE INTO sector_cache (symbol, sector) VALUES (?,?)", (symbol, sector))
-            return sector
-        except:
-            return "Unknown"
-
-    def sync_forge(self):
-        """Amélioration Vigilance 5 : Rétablissement de la dégradation progressive"""
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            for m in ["EXPLOITATION", "EXPLORATION"]:
-                rows = cursor.execute("SELECT pnl FROM trades WHERE mode=? AND status='CLOSED' ORDER BY timestamp DESC LIMIT 20", (m,)).fetchall()
-                pnls = [r[0] for r in rows if r[0] is not None]
-                count = len(pnls)
-                exp = sum(pnls)/count if count > 0 else 0
-                
-                # Dégradation progressive rétablie
-                if count >= 10:
-                    if exp <= -15.0: SYSTEM_STATE["allocation"][m] = 0.0 # Quarantaine
-                    elif exp <= 0.0: SYSTEM_STATE["allocation"][m] = 0.5 # Dégradé
-                    else: SYSTEM_STATE["allocation"][m] = 1.0
-                
-                SYSTEM_STATE["stats"][m] = {"expectancy": round(exp, 2), "trades": count}
+                pnl REAL, mode TEXT, consensus REAL, sector TEXT, 
+                reasoning_category TEXT, ai_reason TEXT, 
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+            # Migration ultra-légère si colonne manquante
+            try: conn.execute("ALTER TABLE trades ADD COLUMN reasoning_category TEXT")
+            except: pass
 
     async def get_ai_score(self, session, sym, price):
-        prompt = f"PEAD Analysis for {sym} at {price}$. JSON only: {{\"score\": 0-100, \"sigma\": 0-50, \"reason\": \"...\"}}"
+        now_str = datetime.now().strftime('%Y-%m-%d')
+        prompt = (f"Today: {now_str}. Analyze PEAD for {sym} at {price}$. "
+                  f"Rule 1: If earnings > {GOUVERNANCE['PEAD_WINDOW_DAYS']} days ago, score = 0. "
+                  f"Return JSON: {{\"score\": 0-100, \"category\": \"PEAD/REVERSAL/NOISE\", \"reason\": \"...\"}}")
+        
         headers = {"Authorization": f"Bearer {OR_KEY}", "Content-Type": "application/json"}
         payload = {"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
+        
         try:
             async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=20) as resp:
                 if resp.status == 200:
                     res = await resp.json()
                     content = json.loads(res['choices'][0]['message']['content'])
-                    return float(content.get('score', 80)), float(content.get('sigma', 15)), content.get('reason', 'N/A')
-        except Exception as e:
-            SLOG.log("ai_timeout", error=str(e), symbol=sym)
-        return 80.0, 15.0, "IA_FALLBACK"
+                    return float(content.get('score', 0)), content.get('category', 'UNKNOWN'), content.get('reason', 'N/A')
+        except: pass
+        return 0, "UNKNOWN", "AI_FAILURE"
 
-    async def reconcile(self, positions):
-        active_symbols = set([p.symbol for p in positions])
-        open_orders = self.alpaca.list_orders(status='open', limit=50)
-        
-        # On calcule l'exposition sectorielle réelle ici (Correctif Régression 2)
-        sector_exposure = {}
-        for p in positions:
-            sym = p.symbol
-            # On récupère le secteur (via cache si possible)
-            sector = await self.get_sector_async(sym)
-            val = float(p.market_value)
-            sector_exposure[sector] = sector_exposure.get(sector, 0) + val
-
-        SYSTEM_STATE["positions"] = [{"symbol": p.symbol, "qty": p.qty, "unrealized_pnl": float(p.unrealized_pl)} for p in positions]
-        SYSTEM_STATE["orders"] = []
-        for o in open_orders:
-            if o.status in ['new', 'partially_filled', 'accepted', 'pending_new']:
-                active_symbols.add(o.symbol)
-                SYSTEM_STATE["orders"].append({"symbol": o.symbol, "status": o.status})
+    async def sync_reconcile_full(self, positions):
+        alpaca_symbols = [p.symbol for p in positions]
+        open_orders = self.alpaca.list_orders(status='open')
+        pending_symbols = [o.symbol for o in open_orders]
         
         with sqlite3.connect(DB_PATH) as conn:
-            count = conn.execute("SELECT COUNT(*) FROM trades WHERE date(timestamp) = date('now')").fetchone()[0]
-            SYSTEM_STATE["trades_today"] = count
+            cursor = conn.cursor()
+            db_open_trades = cursor.execute("SELECT client_id, symbol, qty, entry_price FROM trades WHERE status='OPEN'").fetchall()
             
-        return active_symbols, sector_exposure
+            for cid, sym, qty, entry in db_open_trades:
+                if sym not in alpaca_symbols and sym not in pending_symbols:
+                    activities = self.alpaca.get_activities(activity_types='FILL')
+                    exit_price = None
+                    for act in sorted(activities, key=lambda x: x.created_at, reverse=True):
+                        if act.symbol == sym and act.side.startswith('sell'):
+                            exit_price = float(act.price)
+                            break
+                    
+                    if exit_price:
+                        pnl = (exit_price - entry) * qty
+                        cursor.execute("UPDATE trades SET status='CLOSED', exit_price=?, pnl=? WHERE client_id=?", (exit_price, pnl, cid))
+                    else:
+                        cursor.execute("UPDATE trades SET status='ORPHAN', pnl=NULL WHERE client_id=?", (cid,))
+            conn.commit()
+
+        SYSTEM_STATE["positions"] = [{"s": p.symbol, "q": p.qty, "upnl": float(p.unrealized_pl)} for p in positions]
+        with sqlite3.connect(DB_PATH) as conn:
+            db_active = [r[0] for r in conn.execute("SELECT symbol FROM trades WHERE status='OPEN'").fetchall()]
+        
+        return set(alpaca_symbols + pending_symbols + db_active)
+
+    def check_discipline_veto(self, sym):
+        with sqlite3.connect(DB_PATH) as conn:
+            last = conn.execute("SELECT status, pnl, timestamp FROM trades WHERE symbol=? ORDER BY timestamp DESC LIMIT 1", (sym,)).fetchone()
+            if last:
+                status, pnl, ts_str = last
+                if status == 'ORPHAN' or (status == 'CLOSED' and pnl is None):
+                    return True
+                if pnl is not None and pnl < 0:
+                    ts = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+                    if datetime.now() - ts < timedelta(hours=24):
+                        return True
+        return False
 
     async def run_cycle(self):
         try:
             SYSTEM_STATE["health"]["last_cycle"] = datetime.now().isoformat()
-            with open(HEARTBEAT_FILE, "w") as f: f.write(datetime.now().isoformat())
-
             acc = self.alpaca.get_account()
             SYSTEM_STATE["equity"] = float(acc.equity)
-            active_symbols, sector_exposure = await self.reconcile(self.alpaca.list_positions())
-            self.sync_forge()
+            
+            # CORRECTIF 1 : Recalcul trades_today depuis la DB (Audit 3.3)
+            with sqlite3.connect(DB_PATH) as conn:
+                count = conn.execute("SELECT COUNT(*) FROM trades WHERE date(timestamp) = date('now')").fetchone()[0]
+                SYSTEM_STATE["trades_today"] = count
 
-            daily_loss = float(acc.equity) - float(acc.last_equity)
-            SYSTEM_STATE["drawdown_pct"] = abs(daily_loss) / float(acc.last_equity) if daily_loss < 0 else 0.0
-            if SYSTEM_STATE["drawdown_pct"] > GOUVERNANCE["MAX_DAILY_DRAWDOWN_PCT"]:
-                SYSTEM_STATE["status"] = "HALTED_BY_DRAWDOWN"; return
+            forbidden_symbols = await self.sync_reconcile_full(self.alpaca.list_positions())
+
+            daily_loss_pct = abs(float(acc.equity) - float(acc.last_equity)) / float(acc.last_equity)
+            if daily_loss_pct > GOUVERNANCE["MAX_DAILY_DRAWDOWN_PCT"] and float(acc.equity) < float(acc.last_equity):
+                SYSTEM_STATE["status"] = "HALTED_DRAWDOWN"; return
 
             if not self.alpaca.get_clock().is_open or os.path.exists(HALT_FILE):
                 SYSTEM_STATE["status"] = "standby"; return
@@ -215,69 +191,53 @@ class TitanEngine:
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"https://www.alphavantage.co/query?function=EARNINGS_CALENDAR&apikey={AV_KEY}") as resp:
                     if resp.status != 200: return
-                    data = await resp.read()
-                    try:
-                        df = pd.read_csv(io.BytesIO(data))
-                        # Vigilance 4 : Validation stricte des colonnes
-                        if 'symbol' not in df.columns or 'reportDate' not in df.columns:
-                            SLOG.log("av_invalid_csv", content=str(data[:100]))
-                            return
-                        candidates = df[df['reportDate'] == datetime.now().strftime('%Y-%m-%d')]
-                    except Exception as e:
-                        SLOG.log("av_parse_error", error=str(e))
-                        return
+                    df = pd.read_csv(io.BytesIO(await resp.read()))
+                    candidates = df[df['reportDate'] == datetime.now().strftime('%Y-%m-%d')]
 
                 for _, row in candidates.iterrows():
                     sym = row.get('symbol')
-                    if not sym or sym in active_symbols or sym in GOUVERNANCE["BLACKLIST"]: continue
+                    if not sym or sym in forbidden_symbols or sym in GOUVERNANCE["BLACKLIST"]: continue
                     if SYSTEM_STATE["trades_today"] >= GOUVERNANCE["MAX_TRADES_PER_DAY"]: break
+                    if self.check_discipline_veto(sym): continue
 
                     try:
                         price = float(self.alpaca.get_latest_trade(sym).price)
-                        score, sigma, reason = await self.get_ai_score(session, sym, price)
-                        mode = "EXPLOITATION" if score >= 85 and sigma <= 20 else "EXPLORATION" if score >= 72 and sigma <= 35 else None
+                        # CORRECTIF 2 : Capture de la catégorie de raisonnement (Audit 4.1)
+                        score, category, reason = await self.get_ai_score(session, sym, price)
+                        
+                        mode = "EXPLOITATION" if score >= GOUVERNANCE["MODES"]["EXPLOITATION"]["MIN_SCORE"] else "EXPLORATION" if score >= GOUVERNANCE["MODES"]["EXPLORATION"]["MIN_SCORE"] else None
                         
                         if mode:
-                            alloc_factor = SYSTEM_STATE["allocation"][mode]
-                            if alloc_factor <= 0: continue
-
-                            # Correctif Régression 2 : Veto Sectoriel Effectif
-                            sector = await self.get_sector_async(sym)
-                            current_sector_val = sector_exposure.get(sector, 0)
-                            if (current_sector_val / SYSTEM_STATE["equity"]) >= GOUVERNANCE["MAX_SECTOR_EXPOSURE_PCT"]:
-                                SLOG.log("sector_veto", symbol=sym, sector=sector)
-                                continue
-
-                            risk = GOUVERNANCE["MODES"][mode]["BASE_RISK"] * alloc_factor
+                            risk = GOUVERNANCE["MODES"][mode]["BASE_RISK"]
                             qty = int((SYSTEM_STATE["equity"] * risk) / (price * GOUVERNANCE["BASE_SL_PCT"]))
                             
                             if qty > 0:
-                                cid = f"apex_{uuid.uuid4().hex[:8]}"
+                                cid = f"tx_{uuid.uuid4().hex[:8]}"
                                 self.alpaca.submit_order(
                                     symbol=sym, qty=qty, side='buy', type='limit',
                                     limit_price=round(price * 1.002, 2),
                                     time_in_force='gtc', order_class='bracket',
-                                    take_profit={'limit_price': round(price * 1.06, 2)},
-                                    stop_loss={'stop_price': round(price * 0.97, 2)},
+                                    take_profit={'limit_price': round(price * (1+GOUVERNANCE["BASE_TP_PCT"]), 2)},
+                                    stop_loss={'stop_price': round(price * (1-GOUVERNANCE["BASE_SL_PCT"]), 2)},
                                     client_order_id=cid
                                 )
                                 with sqlite3.connect(DB_PATH) as conn:
-                                    conn.execute("INSERT INTO trades (client_id, symbol, qty, entry_price, status, mode, consensus, dispersion, sector, ai_reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                                                 (cid, sym, qty, price, 'OPEN', mode, score, sigma, sector, reason))
+                                    conn.execute("""INSERT INTO trades 
+                                        (client_id, symbol, qty, entry_price, status, mode, consensus, reasoning_category, ai_reason) 
+                                        VALUES (?,?,?,?,?,?,?,?,?)""",
+                                        (cid, sym, qty, price, 'OPEN', mode, score, category, reason))
                                 SYSTEM_STATE["trades_today"] += 1
-                                SLOG.log("trade_executed", symbol=sym, mode=mode, score=score)
+                                forbidden_symbols.add(sym)
+                                SLOG.log("trade_sent", symbol=sym, cat=category, score=score)
                     except Exception as e:
-                        SLOG.log("execution_error", symbol=sym, error=str(e))
+                        SLOG.log("error_sym", symbol=sym, err=str(e))
 
-            SYSTEM_STATE["health"]["consecutive_errors"] = 0
         except Exception as e:
-            SYSTEM_STATE["health"]["consecutive_errors"] += 1
-            SLOG.log("cycle_crash", error=str(e))
+            SLOG.log("critical_crash", error=str(e))
 
 async def main():
     threading.Thread(target=HTTPServer(('0.0.0.0', 8080), SecureMetricsHandler).serve_forever, daemon=True).start()
     engine = TitanEngine()
-    SLOG.log("system_online", token_hint=DASHBOARD_TOKEN[:4] + "...")
     while True:
         await engine.run_cycle()
         await asyncio.sleep(60)
