@@ -1,21 +1,28 @@
 [Unit]
-Description=Titan-Core v5.6.21 APEX-ULTIMATE
+Description=Titan Apex v9.0.0 (Unstoppable)
 After=network.target
 
 [Service]
-# On utilise l'utilisateur 'ubuntu' par défaut sur AWS
+# Utilisation de l'utilisateur ubuntu (AWS standard)
 User=ubuntu
+Group=ubuntu
 WorkingDirectory=/home/ubuntu/titan-project
+
+# On pointe vers le Python du VENV et le bon script v9
+# REMPLACER 'titan_v900.py' par le nom exact de ton fichier
 ExecStart=/home/ubuntu/titan-project/venv/bin/python /home/ubuntu/titan-project/trading_daemon.py
 
-# Stratégie de redémarrage : on attend 30s pour laisser respirer les API
+# Stratégie de redémarrage : 10s est un bon compromis 
+# pour ne pas rater trop de bougies tout en évitant le spam API
 Restart=always
-RestartSec=30
+RestartSec=10
 
-# --- SECRETS & ENVIRONNEMENT ---
+# --- ENVIRONNEMENT & SECRETS ---
 Environment=PYTHONUNBUFFERED=1
 Environment=ENV_MODE=PAPER
 Environment=LIVE_AFFIRMATION=False
+
+# API KEYS (Pense à utiliser EnvironmentFile=/home/ubuntu/titan-project/.env à l'avenir)
 Environment=ALPACA_API_KEY=VOTRE_CLE_ICI
 Environment=ALPACA_SECRET_KEY=VOTRE_SECRET_ICI
 Environment=FMP_API_KEY=VOTRE_FMP_ICI
@@ -23,9 +30,11 @@ Environment=OPENROUTER_API_KEY=VOTRE_OR_ICI
 Environment=ALPHA_VANTAGE_KEY=VOTRE_CLE_AV
 Environment=TITAN_DASHBOARD_TOKEN=VOTRE_CLE_ICI
 
-# Sécurité système
+# --- SÉCURITÉ RENFORCÉE (Excellent ajout de ta part) ---
 NoNewPrivileges=true
 ProtectSystem=full
+# Empêche le service d'accéder aux dossiers /home des autres users
+ProtectHome=read-only 
 
 [Install]
 WantedBy=multi-user.target
