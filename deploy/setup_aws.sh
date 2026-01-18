@@ -28,7 +28,7 @@ pip install alpaca-trade-api pandas numpy aiohttp yfinance python-dotenv
 echo "⚙️ Installation de Pandas-TA (Branche Development)..."
 pip install pandas-ta
 
-echo "✅ Environnement v5.6.5 prêt."
+echo "✅ Environnement v6.6.5 prêt."
 echo "1. Configurez le fichier /etc/systemd/system/titan-core.service"
 echo "2. Activez avec : sudo systemctl enable --now titan-core"
 
