@@ -2,7 +2,7 @@
 # Script de déploiement Titan v5.6.21 "APEX-ULTIMATE"
 # Cible : Ubuntu 22.04+ | Python 3.12
 
-echo "🚀 Initialisation de Titan v5.6..."
+echo "🚀 Initialisation de Titan v6.6.5"
 
 # 1. Mise à jour et dépôts
 sudo add-apt-repository ppa:deadsnakes/ppa -y
