@@ -215,6 +215,11 @@ class TitanEngine:
                 bars = self.alpaca.get_bars(trade['symbol'], TimeFrame.Minute, limit=1)
                 if not bars: continue
                 price = bars[0].c
+                logger.info(
+                    f"SHADOW_CHECK | {trade['symbol']} | "
+                    f"price={round(price,2)} | "
+                    f"tp={trade['tp_price']} | sl={trade['sl_price']}"
+                )
                 
                 entry_dt = datetime.strptime(trade['entry_time'], '%Y-%m-%d %H:%M:%S')
                 duration = int((datetime.now() - entry_dt).total_seconds() / 60)
@@ -243,12 +248,20 @@ class TitanEngine:
 
         picks = await self.fetch_ai_picks()
         equity = float(self.alpaca.get_account().equity)
+        # --- LOG IA ---
+        if not picks.get("picks"):
+            logger.info("AI_DECISION | no viable picks returned")
+        else:
+            logger.info(f"AI_DECISION | {len(picks['picks'])} candidates received")
         
         executed_in_scan = 0
         for p in picks.get("picks", []):
             symbol = p['symbol'].upper()
             conf = p['confidence']
-            if conf < 80: continue
+            if conf < 80:
+                logger.info(f"REJECT | {symbol} | confidence={conf} (<80)")
+                continue
+
             
             # Insight rejection
             if conf < 88:
@@ -257,6 +270,7 @@ class TitanEngine:
                 self.status["insights"]["last_rejection"] = {"symbol": symbol, "confidence": conf, "required": 88, "reason": "MAX_POSITIONS"}
 
             if symbol in self.last_trade_per_symbol and (datetime.now() - self.last_trade_per_symbol[symbol]) < timedelta(minutes=CONFIG["COOLDOWN_PER_SYMBOL_MIN"]):
+                logger.info(f"REJECT | {symbol} | cooldown active")
                 continue
 
             try:
@@ -319,7 +333,14 @@ class TitanEngine:
                     await self.run_trading_logic()
                 else:
                     self.status["state"] = "SLEEPING"
-
+                # --- HEARTBEAT OBSERVABILITÉ ---
+                logger.info(
+                    f"HEARTBEAT | state={self.status['state']} | "
+                    f"market={self.status['market']} | "
+                    f"live={self.status['positions']['live']} | "
+                    f"shadow={self.status['positions']['shadow_open']} | "
+                    f"equity={self.status['equity']['current']}"
+                )
                 await asyncio.sleep(600)
             except Exception as e:
                 logger.error(f"Global Loop Error: {e}")
