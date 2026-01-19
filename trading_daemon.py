@@ -266,9 +266,31 @@ class TitanEngine:
 async def api_status(request): 
     return web.json_response(request.app['titan'].status)
 
+@web.middleware
+async def cors_middleware(request, handler):
+    # Réponse aux preflight OPTIONS
+    if request.method == "OPTIONS":
+        return web.Response(
+            status=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type",
+                "Access-Control-Max-Age": "86400",
+            },
+        )
+
+    response = await handler(request)
+
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+
+    return response
+
 async def main():
     titan = TitanEngine()
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
     app['titan'] = titan
     app.router.add_get('/status', api_status)
     
