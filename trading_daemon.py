@@ -10,14 +10,15 @@ import alpaca_trade_api as tradeapi
 from alpaca_trade_api.rest import TimeFrame
 from aiohttp import web
 
-# --- CONFIGURATION (ABSOLUTE-VISIBILITY) ---
+# --- CONFIGURATION (OPENROUTER & OMNI-SIGHT) ---
 load_dotenv()
-GEMINI_API_KEY = "" # Géré par l'environnement
-API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN', "admin_secret_token")
+OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
+# Note: L'environnement fournira la clé si configuré, sinon vide pour le mode test
 
 CONFIG = {
-    "VERSION": "7.9.5-Absolute-Visibility",
-    "DB_PATH": "titan_v7_absolute.db",
+    "VERSION": "7.9.6-Omni-Sight-Router",
+    "DB_PATH": "titan_v7_omni.db",
+    "AI_MODEL": "google/gemini-2.0-flash-exp:free",
     "RISK_PER_TRADE_PCT": 0.01,
     "MAX_OPEN_POSITIONS": 5,
     "DAILY_LOSS_LIMIT_PCT": 0.02,
@@ -30,9 +31,9 @@ CONFIG = {
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger("Titan-Absolute")
+logger = logging.getLogger("Titan-OmniRouter")
 
-# --- COUCHE DE DONNÉES (FULL AUDIT) ---
+# --- PERSISTANCE ET AUDIT (IDENTIQUE V7.9.5) ---
 class AbsoluteDB:
     def __init__(self, path):
         self.path = path
@@ -40,7 +41,7 @@ class AbsoluteDB:
 
     def _init_db(self):
         with sqlite3.connect(self.path) as conn:
-            # Table des décisions (L'intention)
+            # Table des décisions (L'intention IA)
             conn.execute("""CREATE TABLE IF NOT EXISTS ai_decision_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -52,19 +53,19 @@ class AbsoluteDB:
                 entry_price_at_decision REAL,
                 tp_price REAL,
                 sl_price REAL,
-                market_context TEXT           -- JSON: Volatilité, Volume
+                market_context TEXT
             )""")
-            # Table des trades (L'exécution)
+            # Table des trades (L'exécution moteur)
             conn.execute("""CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ai_decision_id INTEGER,       -- Lien vers l'audit
+                ai_decision_id INTEGER,
                 symbol TEXT,
                 qty REAL,
                 entry_price REAL,
                 exit_price REAL,
                 entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
                 exit_time DATETIME,
-                result TEXT,                  -- TP / SL / MANUAL
+                result TEXT,
                 confidence INTEGER,
                 tp_target REAL,
                 sl_target REAL,
@@ -112,8 +113,8 @@ class AbsoluteDB:
             res = conn.execute("SELECT value FROM system_state WHERE key='halted'").fetchone()
             return res[0] == '1' if res else False
 
-# --- MOTEUR TITAN ---
-class TitanOmniSight:
+# --- MOTEUR TITAN AVEC OPENROUTER ---
+class TitanOmniRouter:
     def __init__(self):
         self.alpaca = tradeapi.REST(os.getenv('ALPACA_KEY'), os.getenv('ALPACA_SECRET'), "https://paper-api.alpaca.markets")
         self.db = AbsoluteDB(CONFIG["DB_PATH"])
@@ -121,59 +122,77 @@ class TitanOmniSight:
         self.daily_start_equity = 0
 
     async def get_market_context(self, symbol):
-        """Récupère un snapshot rapide du marché pour l'audit"""
         try:
             bars = self.alpaca.get_bars(symbol, TimeFrame.Minute, limit=5)
             if not bars: return {}
             return {
-                "volatility_15m": round((max(b.h for b in bars) - min(b.l for b in bars)) / bars[-1].c * 100, 3),
-                "last_volume": bars[-1].v
+                "volatility": round((max(b.h for b in bars) - min(b.l for b in bars)) / bars[-1].c * 100, 3),
+                "volume": bars[-1].v
             }
         except: return {}
 
     async def get_ia_picks(self):
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={GEMINI_API_KEY}"
-        prompt = (f"Analyze {CONFIG['WATCHLIST']}. Identify momentum breakouts. "
-                 "Return JSON: { 'picks': [{ 'symbol': 'XYZ', 'confidence': 85, 'thesis': 'Reasoning' }] }")
+        """Appel IA via OpenRouter avec format Chat Completion"""
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_KEY}",
+            "HTTP-Referer": "https://titan-trading.system",
+            "X-Title": "Titan Omni-Sight",
+            "Content-Type": "application/json"
+        }
+        
+        prompt = (f"Analyze these stocks: {CONFIG['WATCHLIST']}. "
+                  "Identify high-conviction momentum breakouts. "
+                  "Return a JSON object with a key 'picks' containing a list of objects: "
+                  "{ 'symbol': string, 'confidence': integer 0-100, 'thesis': string (max 20 words) }")
+
+        payload = {
+            "model": CONFIG["AI_MODEL"],
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"}
+        }
+
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}) as resp:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    if resp.status != 200:
+                        logger.error(f"OpenRouter Error {resp.status}: {await resp.text()}")
+                        return []
                     data = await resp.json()
-                    return json.loads(data['candidates'][0]['content']['parts'][0]['text']).get("picks", [])
+                    content = data['choices'][0]['message']['content']
+                    return json.loads(content).get("picks", [])
         except Exception as e:
-            logger.error(f"IA Error: {e}")
+            logger.error(f"OpenRouter Connection Error: {e}")
             return []
 
     async def execute_cycle(self):
         acc = self.alpaca.get_account()
         equity = float(acc.equity)
-        
-        # Check Circuit Breakers
         is_halted = self.db.get_system_halt()
+        
         picks = await self.get_ia_picks()
         trades_count = 0
 
         for pick in picks:
-            symbol = pick['symbol']
-            conf = pick['confidence']
-            thesis = pick['thesis']
+            symbol = pick.get('symbol')
+            conf = pick.get('confidence', 0)
+            thesis = pick.get('thesis', 'N/A')
             
-            # Contexte et prix
             context = await self.get_market_context(symbol)
             try:
                 price = self.alpaca.get_latest_trade(symbol).price
             except: price = 0
             
-            tp, sl = round(price * 1.04, 2), round(price * 0.98, 2)
+            # Paramètres de sortie théoriques pour l'audit
+            tp, sl = round(price * 1.05, 2), round(price * 0.97, 2)
 
-            # Préparation du Log d'Audit
             decision_data = {
                 "symbol": symbol, "confidence": conf, "thesis": thesis,
                 "entry_price": price, "tp_price": tp, "sl_price": sl,
                 "context": context, "decision": "REJECTED", "rejection_reason": "NONE"
             }
 
-            # FILTRAGE LOGIQUE (Documenté)
+            # CHAÎNE DE DÉCISION
             if is_halted:
                 decision_data["rejection_reason"] = "SYSTEM_HALTED"
             elif conf < CONFIG["MIN_CONF_LIVE"]:
@@ -183,9 +202,9 @@ class TitanOmniSight:
             elif len(self.alpaca.list_positions()) >= CONFIG["MAX_OPEN_POSITIONS"]:
                 decision_data["rejection_reason"] = "MAX_POSITIONS_REACHED"
             elif trades_count >= CONFIG["MAX_TRADES_PER_CYCLE"]:
-                decision_data["rejection_reason"] = "CYCLE_LIMIT_REACHED"
+                decision_data["rejection_reason"] = "CYCLE_LIMIT"
             else:
-                # ÉLIGIBLE À L'EXÉCUTION
+                # ÉLIGIBLE
                 try:
                     risk = abs(price - sl)
                     qty = round((equity * CONFIG["RISK_PER_TRADE_PCT"]) / risk, 2)
@@ -194,21 +213,20 @@ class TitanOmniSight:
                                                 time_in_force='gtc', order_class='bracket',
                                                 take_profit={'limit_price': tp}, stop_loss={'stop_price': sl})
                         decision_data["decision"] = "EXECUTED"
-                        logger.info(f"ORDER SENT: {symbol}")
                 except Exception as e:
-                    decision_data["rejection_reason"] = f"EXEC_ERR: {str(e)[:40]}"
+                    decision_data["rejection_reason"] = f"EXEC_FAIL: {str(e)[:30]}"
 
-            # ENREGISTREMENT DE LA DÉCISION (Même si rejeté)
+            # LOG DE LA DÉCISION (Audit intégral)
             d_id = self.db.log_decision(decision_data)
 
-            # Si exécuté, lier au trade
             if decision_data["decision"] == "EXECUTED":
                 self.db.log_trade_start(d_id, symbol, qty, price, conf, tp, sl)
                 self.last_trade_time[symbol] = datetime.now()
                 trades_count += 1
+                logger.info(f"TRADE EXECUTED: {symbol} at {price}")
 
     async def monitor_and_reconcile(self):
-        """Surveille les positions et réconcilie avec la DB lors de la fermeture"""
+        """Réconcilie les positions fermées par le broker avec la base locale"""
         try:
             positions = {p.symbol: p for p in self.alpaca.list_positions()}
             with sqlite3.connect(CONFIG["DB_PATH"]) as conn:
@@ -217,51 +235,51 @@ class TitanOmniSight:
 
             for t in open_db_trades:
                 symbol = t['symbol']
-                # Si le trade est en DB mais plus chez Alpaca -> Fermé par TP/SL
                 if symbol not in positions:
+                    # Le trade est fermé côté broker
                     last_px = self.alpaca.get_latest_trade(symbol).price
                     result = "TP" if last_px >= t['tp_target'] else "SL"
                     if last_px < t['tp_target'] and last_px > t['sl_target']: result = "MANUAL_OR_OTHER"
                     
                     self.db.close_trade_record(symbol, last_px, result)
-                    logger.info(f"TRADE RECONCILED: {symbol} closed as {result} at {last_px}")
+                    logger.info(f"RECONCILED: {symbol} closed as {result}")
                 else:
-                    # Toujours ouvert -> Update MFE/MAE
+                    # Update excursions
                     curr_px = float(positions[symbol].current_price)
                     self.db.update_excursion(t['id'], curr_px)
         except Exception as e:
-            logger.error(f"Monitor error: {e}")
+            logger.error(f"Reconciliation Error: {e}")
 
-    async def run(self):
-        logger.info(f"TITAN {CONFIG['VERSION']} is LIVE.")
+    async def main_loop(self):
+        logger.info(f"TITAN {CONFIG['VERSION']} ON (Model: {CONFIG['AI_MODEL']})")
         while True:
             if self.alpaca.get_clock().is_open:
                 await self.execute_cycle()
                 await self.monitor_and_reconcile()
                 await asyncio.sleep(CONFIG["SCAN_INTERVAL_SEC"])
             else:
+                logger.info("Market Closed. Monitoring only.")
                 await asyncio.sleep(60)
 
-# --- DASHBOARD API ---
-async def start_dashboard(bot):
+# --- DASHBOARD MINIMAL ---
+async def start_api(bot):
     app = web.Application()
-    async def get_stats(request):
+    async def get_status(request):
         with sqlite3.connect(CONFIG["DB_PATH"]) as conn:
             conn.row_factory = sqlite3.Row
-            audit = conn.execute("SELECT * FROM ai_decision_log ORDER BY timestamp DESC LIMIT 10").fetchall()
-            trades = conn.execute("SELECT * FROM trades ORDER BY entry_time DESC LIMIT 10").fetchall()
+            audit_log = conn.execute("SELECT * FROM ai_decision_log ORDER BY timestamp DESC LIMIT 20").fetchall()
             return web.json_response({
                 "bot": CONFIG["VERSION"],
-                "decisions": [dict(r) for r in audit],
-                "last_trades": [dict(r) for r in trades]
+                "model": CONFIG["AI_MODEL"],
+                "audit": [dict(r) for r in audit_log]
             })
-    app.router.add_get('/audit', get_stats)
+    app.router.add_get('/status', get_status)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 8080).start()
 
 if __name__ == "__main__":
-    titan = TitanOmniSight()
+    titan = TitanOmniRouter()
     loop = asyncio.get_event_loop()
-    loop.create_task(start_dashboard(titan))
-    loop.run_until_complete(titan.run())
+    loop.create_task(start_api(titan))
+    loop.run_until_complete(titan.main_loop())
