@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 import alpaca_trade_api as tradeapi
 from alpaca_trade_api.rest import TimeFrame
 from aiohttp import web
-import aiohttp_cors
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -293,15 +292,6 @@ async def main():
     app = web.Application(middlewares=[cors_middleware])
     app['titan'] = titan
     app.router.add_get('/status', api_status)
-    
-    cors = aiohttp_cors.setup(app, defaults={
-        "*": aiohttp_cors.ResourceOptions(
-            allow_credentials=False, 
-            expose_headers="*", 
-            allow_headers=["*"], 
-            allow_methods=["GET", "POST", "OPTIONS"])
-    })
-    for r in list(app.router.routes()): cors.add(r)
     
     runner = web.AppRunner(app)
     await runner.setup()
