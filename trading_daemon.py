@@ -14,14 +14,14 @@ from alpaca_trade_api.rest import TimeFrame
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.2 ---
+# --- CONFIGURATION V8.4 ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 
 CONFIG = {
-    "VERSION": "8.2.0-Context-Aware",
+    "VERSION": "8.4.0-Risk-Governor",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     "MAX_OPEN_POSITIONS": 3,
@@ -29,15 +29,19 @@ CONFIG = {
     "LIVE_THRESHOLD": 82,
     "MARKET_STRESS_THRESHOLD": 1.5,
     "COOLDOWN_PER_SYMBOL_MIN": 15,
-    # --- PARAMETRES ATR & REGIME (v8.2) ---
     "ATR_PERIOD": 14,
-    # Les multiplicateurs sont maintenant dynamiques selon le régime
     "REGIME_CONFIG": {
-        "TREND": {"TP_MULT": 3.0, "SL_MULT": 1.5, "DESC": "Trend following"},
-        "RANGE": {"TP_MULT": 1.5, "SL_MULT": 1.0, "DESC": "Mean reversion"},
-        "CHOP":  {"TP_MULT": 0.0, "SL_MULT": 0.0, "DESC": "No trade zone"} 
+        "TREND": {"TP_MULT": 3.0, "SL_MULT": 1.5, "DESC": "Trend following", "TRAILING": True},
+        "RANGE": {"TP_MULT": 1.5, "SL_MULT": 1.0, "DESC": "Mean reversion", "TRAILING": False},
+        "CHOP":  {"TP_MULT": 0.0, "SL_MULT": 0.0, "DESC": "No trade zone", "TRAILING": False} 
     },
-    # --------------------------------------
+    "BE_TRIGGER_ATR": 1.0,
+    "TRAILING_STEP_ATR": 0.5,
+    # --- GOUVERNANCE DES RISQUES (v8.4) ---
+    "MAX_DAILY_DRAWDOWN_PCT": -4.0,   # Arrêt d'urgence si perte > 4%
+    "MAX_LOSSES_PER_SYMBOL": 2,       # Ban symbole après 2 pertes le même jour
+    "MAX_SL_UPDATES_PER_TRADE": 20,   # Sécurité API (héritage 8.3.1)
+    # -------------------------------------
     "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
     "AI_MODEL": "deepseek/deepseek-v3.2",
     "SCAN_INTERVAL": 60 
@@ -46,11 +50,11 @@ CONFIG = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_2.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_4.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-Context")
+logger = logging.getLogger("Titan-Governor")
 
-# --- UTILITAIRES DE PARSING ---
+# --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
     if not raw_text: return None
     text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL)
@@ -63,12 +67,12 @@ def clean_deepseek_json(raw_text: str):
     except json.JSONDecodeError:
         return None
 
-# --- PERSISTANCE (V8.2) ---
+# --- PERSISTANCE (V8.4) ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
         self._init_db()
-        self._migrate_v8_2()
+        self._migrate_v8_4()
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -80,7 +84,9 @@ class TitanDatabase:
                     result TEXT, confidence INTEGER, thesis TEXT, mode TEXT,
                     tp_price REAL, sl_price REAL, status TEXT DEFAULT 'OPEN',
                     decision_id INTEGER, alpaca_order_id TEXT,
-                    atr_at_entry REAL
+                    atr_at_entry REAL, market_regime TEXT,
+                    highest_price REAL, is_be_active INTEGER DEFAULT 0,
+                    sl_updates_count INTEGER DEFAULT 0
                 )
             """)
             conn.execute("""
@@ -98,26 +104,31 @@ class TitanDatabase:
             conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('halt_reason', '')")
             conn.commit()
 
-    def _migrate_v8_2(self):
-        """Migration v8.2: Ajout colonne Regime."""
+    def _migrate_v8_4(self):
+        """Migration v8.4: S'assurer que les colonnes de robustesse sont là."""
         with sqlite3.connect(self.db_path) as conn:
-            # v8.1 column
             try:
-                conn.execute("ALTER TABLE trades ADD COLUMN atr_at_entry REAL")
+                conn.execute("ALTER TABLE trades ADD COLUMN sl_updates_count INTEGER DEFAULT 0")
+                logger.info("Migration DB: Colonne 'sl_updates_count' ajoutée.")
             except sqlite3.OperationalError: pass
-            
-            # v8.2 column
-            try:
-                conn.execute("ALTER TABLE trades ADD COLUMN market_regime TEXT")
-                logger.info("Migration DB: Colonne 'market_regime' ajoutée.")
-            except sqlite3.OperationalError: pass
+            try: conn.execute("ALTER TABLE trades ADD COLUMN highest_price REAL") 
+            except: pass
+            try: conn.execute("ALTER TABLE trades ADD COLUMN is_be_active INTEGER DEFAULT 0") 
+            except: pass
 
     def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id, order_id=None, atr=0.0, regime="UNKNOWN"):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""INSERT INTO trades 
-                (symbol, qty, entry_price, confidence, thesis, mode, tp_price, sl_price, status, decision_id, alpaca_order_id, atr_at_entry, market_regime) 
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (symbol, qty, price, conf, thesis, mode, tp, sl, 'OPEN', dec_id, order_id, atr, regime))
+                (symbol, qty, entry_price, confidence, thesis, mode, tp_price, sl_price, status, decision_id, alpaca_order_id, atr_at_entry, market_regime, highest_price, sl_updates_count) 
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                (symbol, qty, price, conf, thesis, mode, tp, sl, 'OPEN', dec_id, order_id, atr, regime, price))
+            conn.commit()
+
+    def update_trade_state(self, trade_id, highest_price, new_sl, be_active, update_count):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                UPDATE trades SET highest_price=?, sl_price=?, is_be_active=?, sl_updates_count=? WHERE id=?
+            """, (highest_price, new_sl, 1 if be_active else 0, update_count, trade_id))
             conn.commit()
 
     def close_trade(self, trade_id, exit_price, result):
@@ -131,9 +142,18 @@ class TitanDatabase:
     def get_open_trades(self, mode=None):
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            if mode:
-                return conn.execute("SELECT * FROM trades WHERE status='OPEN' AND mode=?", (mode,)).fetchall()
-            return conn.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()
+            query = "SELECT * FROM trades WHERE status='OPEN'"
+            if mode: query += f" AND mode='{mode}'"
+            return conn.execute(query).fetchall()
+
+    def get_symbol_daily_losses(self, symbol):
+        """Compte les SL pour un symbole aujourd'hui."""
+        with sqlite3.connect(self.db_path) as conn:
+            count = conn.execute("""
+                SELECT COUNT(*) FROM trades 
+                WHERE symbol=? AND result='SL' AND date(exit_time) = date('now')
+            """, (symbol,)).fetchone()[0]
+            return count
 
     def get_stats(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -146,8 +166,6 @@ class TitanDatabase:
             shadows = conn.execute("SELECT result FROM trades WHERE mode='SHADOW' AND status='CLOSED' AND date(exit_time) = date('now')").fetchall()
             res['shadow_winrate'] = round((len([r for (r,) in shadows if r == 'TP']) / len(shadows) * 100), 2) if shadows else 0
             res['shadow_open_count'] = conn.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN' AND mode='SHADOW'").fetchone()[0]
-            last_dec = conn.execute("SELECT symbol, action, reason FROM ai_decision_log ORDER BY id DESC LIMIT 1").fetchone()
-            res['last_action'] = f"{last_dec[0]}: {last_dec[1]}" if last_dec else "N/A"
             return res
 
     def get_halt_state(self):
@@ -213,39 +231,19 @@ class TitanEngine:
         return sum(prices[-period:]) / period
 
     def analyze_market_regime(self, bars):
-        """
-        Détermine le régime de marché (TREND, RANGE, CHOP).
-        Utilise SMA Alignment et Volatilité relative.
-        """
-        if len(bars) < 50: return "UNCERTAIN" # Besoin d'historique pour SMA50
-
+        if len(bars) < 50: return "UNCERTAIN"
         prices = [b.c for b in bars]
-        
         sma20 = self._calculate_sma(prices, 20)
         sma50 = self._calculate_sma(prices, 50)
-        
         if not sma20 or not sma50: return "UNCERTAIN"
-
         current_price = prices[-1]
-        
-        # 1. Trend Filter: Alignement SMA
-        # Uptrend: Prix > SMA20 > SMA50
         is_uptrend = current_price > sma20 > sma50
-        # Downtrend: Prix < SMA20 < SMA50
         is_downtrend = current_price < sma20 < sma50
-        
-        # 2. Volatility Context (Range vs Trend strength)
-        # On regarde si les SMAs sont proches (Compression/Range) ou écartées (Expansion/Trend)
         sma_spread = abs(sma20 - sma50) / sma50 * 100
         
-        if sma_spread < 0.5: 
-            # SMAs très proches = Compression = RANGE ou CHOP
-            # Si le prix oscille autour des SMAs sans direction claire
-            return "RANGE"
-        elif is_uptrend or is_downtrend:
-            return "TREND"
-        else:
-            return "CHOP" # Désordre (Prix > SMA50 mais < SMA20 etc.)
+        if sma_spread < 0.5: return "RANGE"
+        elif is_uptrend or is_downtrend: return "TREND"
+        else: return "CHOP"
 
     def calculate_atr(self, bars, period=14):
         if len(bars) < period + 1: return 0.0
@@ -264,58 +262,134 @@ class TitanEngine:
             start_eq = self.db.get_or_create_daily_stats(eq)
             pnl_pct = ((eq - start_eq) / start_eq * 100) if start_eq > 0 else 0.0
             
+            # --- GOVERNOR CHECK (v8.4) ---
+            if pnl_pct <= CONFIG["MAX_DAILY_DRAWDOWN_PCT"]:
+                is_halted, _ = self.db.get_halt_state()
+                if not is_halted:
+                    reason = f"MAX DRAWDOWN HIT ({round(pnl_pct, 2)}%)"
+                    self.db.set_halt_state(True, reason)
+                    logger.critical(f"🛑 SYSTEM HALTED: {reason}")
+            # -----------------------------
+
             clock = self.alpaca.get_clock()
             stats = self.db.get_stats()
-            
             self.status.update({
                 "market": "OPEN" if clock.is_open else "CLOSED",
                 "equity": {"current": round(eq, 2), "pnl_pct": round(pnl_pct, 2)},
-                "positions": {
-                    "live": len(self.alpaca.list_positions()), 
-                    "shadow_open": stats['shadow_open_count']
-                },
+                "positions": {"live": len(self.alpaca.list_positions()), "shadow_open": stats['shadow_open_count']},
                 "safety": {"consecutive_sl": stats['consecutive_sl']},
                 "omni": stats
             })
         except Exception as e: logger.error(f"Sync error: {e}")
 
-    async def reconcile_trades(self):
-        # 1. SHADOW RECON
-        shadow_trades = self.db.get_open_trades(mode='SHADOW')
-        for t in shadow_trades:
-            try:
-                bars = self.alpaca.get_bars(t['symbol'], TimeFrame.Minute, limit=1)
-                if not bars: continue
-                price = bars[0].c
-                if price >= t['tp_price']: self.db.close_trade(t['id'], price, "TP")
-                elif price <= t['sl_price']: self.db.close_trade(t['id'], price, "SL")
-            except Exception: pass
+    async def manage_trade_lifecycle(self, t, current_price, regime_cfg):
+        """Gestionnaire de SL Dynamique (Durci v8.4)"""
+        if t['status'] != 'OPEN': return
 
-        # 2. LIVE RECON
-        live_trades = self.db.get_open_trades(mode='LIVE')
-        if not live_trades: return
-        
-        positions = {p.symbol: p for p in self.alpaca.list_positions()}
-        
-        for t in live_trades:
-            if t['symbol'] in positions: continue
+        # Security: Anti-Spam API
+        current_updates = t['sl_updates_count'] or 0
+        if current_updates >= CONFIG["MAX_SL_UPDATES_PER_TRADE"]:
+            return
 
-            # Vérification Fills et Statut Ordre
-            activities = self.alpaca.get_activities(activity_types='FILL')
-            symbol_fills = [f for f in activities if f.symbol == t['symbol']]
-            
-            if t['alpaca_order_id']:
+        highest = max(t['highest_price'] or t['entry_price'], current_price)
+        atr = t['atr_at_entry']
+        if atr <= 0: return
+        
+        entry = t['entry_price']
+        current_sl = t['sl_price']
+        new_sl = current_sl
+        update_needed = False
+        is_be = bool(t['is_be_active'])
+
+        # Logique BE
+        if not is_be and (current_price >= entry + (atr * CONFIG["BE_TRIGGER_ATR"])):
+            new_sl = entry 
+            is_be = True
+            update_needed = True
+            logger.info(f"🛡️ BREAK-EVEN Triggered for {t['symbol']} at {current_price}")
+
+        # Logique Trailing
+        if regime_cfg["TRAILING"] and is_be:
+            trail_dist = atr * regime_cfg["SL_MULT"]
+            potential_sl = highest - trail_dist
+            if potential_sl > (new_sl + (atr * CONFIG["TRAILING_STEP_ATR"])):
+                new_sl = round(potential_sl, 2)
+                update_needed = True
+                logger.info(f"📈 TRAILING UP for {t['symbol']}: New SL {new_sl}")
+
+        # Exécution Sécurisée
+        if update_needed and new_sl > current_sl:
+            success = False
+            if t['mode'] == 'LIVE':
                 try:
-                    order = self.alpaca.get_order(t['alpaca_order_id'])
-                    if order.status in ['canceled', 'expired', 'rejected']:
-                        self.db.close_trade(t['id'], 0, "VOID")
-                        continue
-                except Exception: pass
+                    orders = self.alpaca.list_orders(status='open', symbols=[t['symbol']])
+                    sl_order = next((o for o in orders if o.type == 'stop' and o.parent_id == t['alpaca_order_id']), None)
+                    # Fallback robuste
+                    if not sl_order:
+                        sl_order = next((o for o in orders if o.type == 'stop'), None)
 
-            if symbol_fills:
-                exit_price = float(symbol_fills[0].price) 
-                res = "TP" if exit_price >= t['entry_price'] else "SL"
-                self.db.close_trade(t['id'], exit_price, res)
+                    if sl_order:
+                        self.alpaca.replace_order(sl_order.id, stop_price=new_sl)
+                        success = True
+                        logger.info(f"✅ ALPACA ORDER UPDATED {t['symbol']} SL -> {new_sl}")
+                    else:
+                        logger.error(f"❌ CRITICAL: SL Order NOT FOUND for {t['symbol']}")
+                except Exception as e:
+                    logger.error(f"❌ API ERROR updating {t['symbol']}: {e}")
+            else:
+                success = True
+
+            if success:
+                self.db.update_trade_state(t['id'], highest, new_sl, is_be, current_updates + 1)
+
+    async def reconcile_trades(self):
+        trades = self.db.get_open_trades()
+        if not trades: return
+
+        live_positions = {p.symbol: p for p in self.alpaca.list_positions()} if self.alpaca else {}
+
+        for t in trades:
+            symbol = t['symbol']
+            
+            # PHASE 1: Vérification Fermeture
+            if t['mode'] == 'LIVE' and symbol not in live_positions:
+                activities = self.alpaca.get_activities(activity_types='FILL')
+                symbol_fills = [f for f in activities if f.symbol == symbol]
+                if t['alpaca_order_id']:
+                    try:
+                        order = self.alpaca.get_order(t['alpaca_order_id'])
+                        if order.status in ['canceled', 'expired', 'rejected']:
+                            self.db.close_trade(t['id'], 0, "VOID")
+                            continue
+                    except: pass
+
+                if symbol_fills:
+                    exit_price = float(symbol_fills[0].price)
+                    res = "TP" if exit_price >= t['entry_price'] else "SL"
+                    self.db.close_trade(t['id'], exit_price, res)
+                continue
+
+            # PHASE 2: Gestion Active
+            try:
+                bars = self.alpaca.get_bars(symbol, TimeFrame.Minute, limit=1)
+                if not bars: continue
+                current_price = bars[0].c
+
+                if t['mode'] == 'SHADOW':
+                    if current_price >= t['tp_price']: self.db.close_trade(t['id'], current_price, "TP")
+                    elif current_price <= t['sl_price']: self.db.close_trade(t['id'], current_price, "SL")
+                    else:
+                        regime = t['market_regime'] if 'market_regime' in t.keys() else "RANGE"
+                        cfg = CONFIG["REGIME_CONFIG"].get(regime, CONFIG["REGIME_CONFIG"]["RANGE"])
+                        await self.manage_trade_lifecycle(t, current_price, cfg)
+
+                elif t['mode'] == 'LIVE':
+                    regime = t['market_regime'] if 'market_regime' in t.keys() else "RANGE"
+                    cfg = CONFIG["REGIME_CONFIG"].get(regime, CONFIG["REGIME_CONFIG"]["RANGE"])
+                    await self.manage_trade_lifecycle(t, current_price, cfg)
+
+            except Exception as e:
+                logger.error(f"Recon error on {symbol}: {e}")
 
     async def fetch_ai_picks(self):
         s = await self.get_session()
@@ -340,7 +414,6 @@ class TitanEngine:
     async def run_logic(self):
         await self.reconcile_trades()
         
-        # 1. Market Stress Check
         spy_vol = 0.0
         try:
             spy = self.alpaca.get_bars("SPY", TimeFrame.Minute, limit=20)
@@ -361,12 +434,21 @@ class TitanEngine:
             conf, thesis = p.get('confidence', 0), p.get('reason', 'N/A')
             if not symbol: continue
             
+            # --- GOVERNOR CHECKS (v8.4) ---
+            
+            # 1. Cooldown Temporel
             if symbol in self.last_trade_per_symbol and (datetime.now() - self.last_trade_per_symbol[symbol]) < timedelta(minutes=CONFIG["COOLDOWN_PER_SYMBOL_MIN"]):
                 self.db.log_decision(symbol, conf, thesis, "SKIP", "COOLDOWN", ai_raw=raw_text)
                 continue
 
+            # 2. Blacklist Journalière (Toxic Symbol)
+            daily_losses = self.db.get_symbol_daily_losses(symbol)
+            if daily_losses >= CONFIG["MAX_LOSSES_PER_SYMBOL"]:
+                 self.db.log_decision(symbol, conf, thesis, "SKIP", f"TOXIC_SYMBOL_BAN (Losses:{daily_losses})", ai_raw=raw_text)
+                 continue
+            # ------------------------------
+
             try:
-                # 2. Context Analysis (v8.2: Besoin de 60 bars pour SMA50 + ATR)
                 bars = self.alpaca.get_bars(symbol, TimeFrame.Minute, limit=60)
                 if not bars or len(bars) < 55:
                     self.db.log_decision(symbol, conf, thesis, "SKIP", "NO_DATA", ai_raw=raw_text)
@@ -374,33 +456,27 @@ class TitanEngine:
 
                 entry = bars[-1].c
                 atr = self.calculate_atr(bars, period=CONFIG["ATR_PERIOD"])
-                regime = self.analyze_market_regime(bars) # Nouveau en v8.2
+                regime = self.analyze_market_regime(bars)
 
                 if atr == 0: continue
-
-                # 3. Regime-based Parameters
                 if regime == "CHOP":
                     self.db.log_decision(symbol, conf, thesis, "SKIP", "REGIME_CHOP", ai_raw=raw_text)
                     continue
                 
-                # Sélection des multiplicateurs selon le régime
                 regime_settings = CONFIG["REGIME_CONFIG"].get(regime, CONFIG["REGIME_CONFIG"]["RANGE"])
                 tp_mult = regime_settings["TP_MULT"]
                 sl_mult = regime_settings["SL_MULT"]
 
                 sl_dist = atr * sl_mult
                 tp_dist = atr * tp_mult
-                
                 tp = round(entry + tp_dist, 2)
                 sl = round(entry - sl_dist, 2)
                 
-                if sl_dist < (entry * 0.001): continue # SL trop serré
+                if sl_dist < (entry * 0.001): continue
 
-                # Risk Sizing
                 qty = math.floor(CONFIG["DOLLAR_RISK_PER_TRADE"] / sl_dist)
                 if qty < 1: continue
 
-                # 4. Décision & Execution
                 can_live = (conf >= CONFIG["LIVE_THRESHOLD"] and 
                            self.status["positions"]["live"] < CONFIG["MAX_OPEN_POSITIONS"] and 
                            not self.status["safety"]["market_stress"])
@@ -473,7 +549,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Context v8.2 Ready. Regime Detection Active.")
+    logger.info(f"Titan-Governor v8.4 Ready. Global Risk Controls Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
