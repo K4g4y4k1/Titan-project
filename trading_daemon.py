@@ -14,14 +14,15 @@ from alpaca_trade_api.rest import TimeFrame
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.4 ---
+# --- CONFIGURATION V8.4.1 ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
+TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "") # Discord/Slack Webhook
 
 CONFIG = {
-    "VERSION": "8.4.0-Risk-Governor",
+    "VERSION": "8.4.1-Command-Link",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     "MAX_OPEN_POSITIONS": 3,
@@ -37,11 +38,13 @@ CONFIG = {
     },
     "BE_TRIGGER_ATR": 1.0,
     "TRAILING_STEP_ATR": 0.5,
-    # --- GOUVERNANCE DES RISQUES (v8.4) ---
-    "MAX_DAILY_DRAWDOWN_PCT": -4.0,   # Arrêt d'urgence si perte > 4%
-    "MAX_LOSSES_PER_SYMBOL": 2,       # Ban symbole après 2 pertes le même jour
-    "MAX_SL_UPDATES_PER_TRADE": 20,   # Sécurité API (héritage 8.3.1)
-    # -------------------------------------
+    "MAX_DAILY_DRAWDOWN_PCT": -4.0,
+    "MAX_LOSSES_PER_SYMBOL": 2,
+    "MAX_SL_UPDATES_PER_TRADE": 20,
+    # --- COMMAND LINK (v8.4.1) ---
+    "HEARTBEAT_INTERVAL_MIN": 60,     # Ping de vie toutes les heures
+    "NOTIFY_LEVEL": "INFO",           # INFO, TRADE, CRITICAL
+    # -----------------------------
     "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
     "AI_MODEL": "deepseek/deepseek-v3.2",
     "SCAN_INTERVAL": 60 
@@ -50,9 +53,9 @@ CONFIG = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_4.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_4_1.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-Governor")
+logger = logging.getLogger("Titan-Command")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -66,6 +69,61 @@ def clean_deepseek_json(raw_text: str):
         return json.loads(match.group(0))
     except json.JSONDecodeError:
         return None
+
+# --- NOTIFICATION MANAGER (V8.4.1) ---
+class NotificationManager:
+    """Gestionnaire asynchrone des communications sortantes (Discord/Slack)."""
+    def __init__(self, webhook_url):
+        self.webhook_url = webhook_url
+        self.session = None
+
+    async def _get_session(self):
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
+
+    async def send(self, title, message, color=0x3498db, priority="INFO"):
+        """Envoi générique formaté pour Discord Webhooks."""
+        if not self.webhook_url: return
+        
+        # Mapping couleurs
+        if priority == "CRITICAL": color = 0xe74c3c # Rouge
+        elif priority == "TRADE": color = 0x2ecc71    # Vert
+        elif priority == "WARNING": color = 0xf1c40f  # Jaune
+        
+        payload = {
+            "embeds": [{
+                "title": f"[{CONFIG['ENV_MODE']}] {title}",
+                "description": message,
+                "color": color,
+                "footer": {"text": f"Titan v{CONFIG['VERSION']}"},
+                "timestamp": datetime.utcnow().isoformat()
+            }]
+        }
+        
+        try:
+            session = await self._get_session()
+            async with session.post(self.webhook_url, json=payload) as resp:
+                if resp.status >= 400:
+                    logger.error(f"Webhook failed: {resp.status}")
+        except Exception as e:
+            logger.error(f"Notification error: {e}")
+
+    async def send_trade_entry(self, symbol, side, qty, price, thesis, regime):
+        msg = f"**Symbol:** {symbol}\n**Side:** {side}\n**Qty:** {qty}\n**Price:** ${price}\n**Regime:** {regime}\n**Thesis:** {thesis}"
+        await self.send(f"🚀 Trade Entry: {symbol}", msg, priority="TRADE")
+
+    async def send_trade_exit(self, symbol, result, entry, exit_price, pnl_pct):
+        emoji = "💰" if result == "TP" else "🛑"
+        msg = f"**Result:** {result}\n**Entry:** ${entry}\n**Exit:** ${exit_price}\n**Move:** {pnl_pct}%"
+        await self.send(f"{emoji} Trade Closed: {symbol}", msg, priority="TRADE")
+
+    async def send_heartbeat(self, status, equity, pnl_day, spy_vol):
+        msg = f"**State:** {status}\n**Equity:** ${equity}\n**Day PnL:** {pnl_day}%\n**SPY Vol:** {spy_vol}%"
+        await self.send("💓 System Heartbeat", msg, priority="INFO")
+
+    async def send_halt(self, reason):
+        await self.send("🛑 SYSTEM HALTED", f"@here **Risk Governor Triggered**\nReason: {reason}", priority="CRITICAL")
 
 # --- PERSISTANCE (V8.4) ---
 class TitanDatabase:
@@ -105,12 +163,9 @@ class TitanDatabase:
             conn.commit()
 
     def _migrate_v8_4(self):
-        """Migration v8.4: S'assurer que les colonnes de robustesse sont là."""
         with sqlite3.connect(self.db_path) as conn:
-            try:
-                conn.execute("ALTER TABLE trades ADD COLUMN sl_updates_count INTEGER DEFAULT 0")
-                logger.info("Migration DB: Colonne 'sl_updates_count' ajoutée.")
-            except sqlite3.OperationalError: pass
+            try: conn.execute("ALTER TABLE trades ADD COLUMN sl_updates_count INTEGER DEFAULT 0")
+            except: pass
             try: conn.execute("ALTER TABLE trades ADD COLUMN highest_price REAL") 
             except: pass
             try: conn.execute("ALTER TABLE trades ADD COLUMN is_be_active INTEGER DEFAULT 0") 
@@ -147,7 +202,6 @@ class TitanDatabase:
             return conn.execute(query).fetchall()
 
     def get_symbol_daily_losses(self, symbol):
-        """Compte les SL pour un symbole aujourd'hui."""
         with sqlite3.connect(self.db_path) as conn:
             count = conn.execute("""
                 SELECT COUNT(*) FROM trades 
@@ -206,8 +260,11 @@ class TitanEngine:
         base_url = "https://paper-api.alpaca.markets" if CONFIG["ENV_MODE"] == 'PAPER' else "https://api.alpaca.markets"
         self.alpaca = tradeapi.REST(self.alpaca_key, self.alpaca_secret, base_url)
         self.db = TitanDatabase(CONFIG["DB_PATH"])
+        self.notifier = NotificationManager(TITAN_WEBHOOK_URL)
         self.session = None
         self.last_trade_per_symbol = {}
+        self.last_heartbeat = datetime.min
+        self.was_market_open = False
         
         is_halted, reason = self.db.get_halt_state()
         self.status = {
@@ -262,34 +319,45 @@ class TitanEngine:
             start_eq = self.db.get_or_create_daily_stats(eq)
             pnl_pct = ((eq - start_eq) / start_eq * 100) if start_eq > 0 else 0.0
             
-            # --- GOVERNOR CHECK (v8.4) ---
+            # --- GOVERNOR CHECK ---
             if pnl_pct <= CONFIG["MAX_DAILY_DRAWDOWN_PCT"]:
                 is_halted, _ = self.db.get_halt_state()
                 if not is_halted:
                     reason = f"MAX DRAWDOWN HIT ({round(pnl_pct, 2)}%)"
                     self.db.set_halt_state(True, reason)
                     logger.critical(f"🛑 SYSTEM HALTED: {reason}")
-            # -----------------------------
+                    await self.notifier.send_halt(reason)
 
             clock = self.alpaca.get_clock()
+            is_open = clock.is_open
+            
+            # Reporting automatique à la fermeture
+            if self.was_market_open and not is_open:
+                await self.notifier.send("🏁 Market Closed", f"End of day summary.\n**Equity:** ${round(eq, 2)}\n**Daily PnL:** {round(pnl_pct, 2)}%", priority="INFO")
+            self.was_market_open = is_open
+
             stats = self.db.get_stats()
             self.status.update({
-                "market": "OPEN" if clock.is_open else "CLOSED",
+                "market": "OPEN" if is_open else "CLOSED",
                 "equity": {"current": round(eq, 2), "pnl_pct": round(pnl_pct, 2)},
                 "positions": {"live": len(self.alpaca.list_positions()), "shadow_open": stats['shadow_open_count']},
                 "safety": {"consecutive_sl": stats['consecutive_sl']},
                 "omni": stats
             })
+
+            # --- HEARTBEAT ---
+            if datetime.now() - self.last_heartbeat > timedelta(minutes=CONFIG["HEARTBEAT_INTERVAL_MIN"]):
+                spy_vol = 0.0 # Simplification, valeur réelle calculée dans run_logic
+                await self.notifier.send_heartbeat(self.status["state"], round(eq, 2), round(pnl_pct, 2), "N/A")
+                self.last_heartbeat = datetime.now()
+
         except Exception as e: logger.error(f"Sync error: {e}")
 
     async def manage_trade_lifecycle(self, t, current_price, regime_cfg):
-        """Gestionnaire de SL Dynamique (Durci v8.4)"""
         if t['status'] != 'OPEN': return
-
-        # Security: Anti-Spam API
+        
         current_updates = t['sl_updates_count'] or 0
-        if current_updates >= CONFIG["MAX_SL_UPDATES_PER_TRADE"]:
-            return
+        if current_updates >= CONFIG["MAX_SL_UPDATES_PER_TRADE"]: return
 
         highest = max(t['highest_price'] or t['entry_price'], current_price)
         atr = t['atr_at_entry']
@@ -301,30 +369,25 @@ class TitanEngine:
         update_needed = False
         is_be = bool(t['is_be_active'])
 
-        # Logique BE
         if not is_be and (current_price >= entry + (atr * CONFIG["BE_TRIGGER_ATR"])):
             new_sl = entry 
             is_be = True
             update_needed = True
-            logger.info(f"🛡️ BREAK-EVEN Triggered for {t['symbol']} at {current_price}")
+            await self.notifier.send(f"🛡️ Break-Even: {t['symbol']}", f"Price reached +1 ATR. SL moved to Entry.", priority="TRADE")
 
-        # Logique Trailing
         if regime_cfg["TRAILING"] and is_be:
             trail_dist = atr * regime_cfg["SL_MULT"]
             potential_sl = highest - trail_dist
             if potential_sl > (new_sl + (atr * CONFIG["TRAILING_STEP_ATR"])):
                 new_sl = round(potential_sl, 2)
                 update_needed = True
-                logger.info(f"📈 TRAILING UP for {t['symbol']}: New SL {new_sl}")
 
-        # Exécution Sécurisée
         if update_needed and new_sl > current_sl:
             success = False
             if t['mode'] == 'LIVE':
                 try:
                     orders = self.alpaca.list_orders(status='open', symbols=[t['symbol']])
                     sl_order = next((o for o in orders if o.type == 'stop' and o.parent_id == t['alpaca_order_id']), None)
-                    # Fallback robuste
                     if not sl_order:
                         sl_order = next((o for o in orders if o.type == 'stop'), None)
 
@@ -351,10 +414,12 @@ class TitanEngine:
         for t in trades:
             symbol = t['symbol']
             
-            # PHASE 1: Vérification Fermeture
+            # PHASE 1: Fermeture
             if t['mode'] == 'LIVE' and symbol not in live_positions:
                 activities = self.alpaca.get_activities(activity_types='FILL')
                 symbol_fills = [f for f in activities if f.symbol == symbol]
+                
+                # Check canceled
                 if t['alpaca_order_id']:
                     try:
                         order = self.alpaca.get_order(t['alpaca_order_id'])
@@ -366,10 +431,14 @@ class TitanEngine:
                 if symbol_fills:
                     exit_price = float(symbol_fills[0].price)
                     res = "TP" if exit_price >= t['entry_price'] else "SL"
+                    move_pct = round((exit_price - t['entry_price']) / t['entry_price'] * 100, 2)
+                    
                     self.db.close_trade(t['id'], exit_price, res)
+                    # NOTIFICATION EXIT
+                    await self.notifier.send_trade_exit(symbol, res, t['entry_price'], exit_price, move_pct)
                 continue
 
-            # PHASE 2: Gestion Active
+            # PHASE 2: Gestion
             try:
                 bars = self.alpaca.get_bars(symbol, TimeFrame.Minute, limit=1)
                 if not bars: continue
@@ -434,19 +503,14 @@ class TitanEngine:
             conf, thesis = p.get('confidence', 0), p.get('reason', 'N/A')
             if not symbol: continue
             
-            # --- GOVERNOR CHECKS (v8.4) ---
-            
-            # 1. Cooldown Temporel
             if symbol in self.last_trade_per_symbol and (datetime.now() - self.last_trade_per_symbol[symbol]) < timedelta(minutes=CONFIG["COOLDOWN_PER_SYMBOL_MIN"]):
                 self.db.log_decision(symbol, conf, thesis, "SKIP", "COOLDOWN", ai_raw=raw_text)
                 continue
 
-            # 2. Blacklist Journalière (Toxic Symbol)
             daily_losses = self.db.get_symbol_daily_losses(symbol)
             if daily_losses >= CONFIG["MAX_LOSSES_PER_SYMBOL"]:
                  self.db.log_decision(symbol, conf, thesis, "SKIP", f"TOXIC_SYMBOL_BAN (Losses:{daily_losses})", ai_raw=raw_text)
                  continue
-            # ------------------------------
 
             try:
                 bars = self.alpaca.get_bars(symbol, TimeFrame.Minute, limit=60)
@@ -473,7 +537,6 @@ class TitanEngine:
                 sl = round(entry - sl_dist, 2)
                 
                 if sl_dist < (entry * 0.001): continue
-
                 qty = math.floor(CONFIG["DOLLAR_RISK_PER_TRADE"] / sl_dist)
                 if qty < 1: continue
 
@@ -492,6 +555,8 @@ class TitanEngine:
                     )
                     self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id, order.id, atr, regime)
                     logger.info(f"LIVE [{regime}]: {symbol} Qty:{qty} TP:{tp} SL:{sl}")
+                    # NOTIFICATION ENTRY
+                    await self.notifier.send_trade_entry(symbol, "BUY", qty, entry, thesis, regime)
                 else:
                     rej = "STRESS" if self.status["safety"]["market_stress"] else "CONF/LIMIT"
                     dec_id = self.db.log_decision(symbol, conf, thesis, "SHADOW", f"{rej} ({log_msg})", ai_raw=raw_text)
@@ -528,6 +593,7 @@ async def api_decisions(request):
         return web.json_response([dict(r) for r in rows])
 async def api_resume(request):
     request.app['titan'].db.set_halt_state(False)
+    await request.app['titan'].notifier.send("▶️ System Resumed", "Manual resume triggered via API.", priority="WARNING")
     return web.json_response({"status": "resumed"})
 
 @web.middleware
@@ -549,7 +615,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Governor v8.4 Ready. Global Risk Controls Active.")
+    logger.info(f"Titan-Command v8.4.1 Ready. Webhook: {'Active' if TITAN_WEBHOOK_URL else 'Inactive'}")
     await titan.main_loop()
 
 if __name__ == "__main__":
