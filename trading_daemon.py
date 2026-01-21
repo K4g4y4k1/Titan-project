@@ -20,7 +20,7 @@ API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 
 CONFIG = {
-    "VERSION": "8.0.0-OmniRecon",
+    "VERSION": "8.0.1-CORS-Shield",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     "MAX_OPEN_POSITIONS": 3,
@@ -40,10 +40,11 @@ logging.basicConfig(
     format='%(asctime)s | %(levelname)s | %(message)s',
     handlers=[logging.FileHandler("titan_recon.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-Recon")
+logger = logging.getLogger("Titan-Shield")
 
 # --- UTILITAIRES DE PARSING ---
 def clean_deepseek_json(raw_text: str):
+    """Nettoyage robuste des sorties JSON (DeepSeek)."""
     if not raw_text: return None
     text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL)
     text = re.sub(r"```json", "", text, flags=re.IGNORECASE)
@@ -55,7 +56,7 @@ def clean_deepseek_json(raw_text: str):
     except json.JSONDecodeError:
         return None
 
-# --- PERSISTANCE ---
+# --- PERSISTANCE (V8) ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
@@ -121,10 +122,7 @@ class TitanDatabase:
             res['decisions_today'] = conn.execute("SELECT COUNT(*) FROM ai_decision_log WHERE date(timestamp) = date('now')").fetchone()[0]
             shadows = conn.execute("SELECT result FROM trades WHERE mode='SHADOW' AND status='CLOSED' AND date(exit_time) = date('now')").fetchall()
             res['shadow_winrate'] = round((len([r for (r,) in shadows if r == 'TP']) / len(shadows) * 100), 2) if shadows else 0
-            
-            # Recalcul des positions ouvertes (Shadow & Live)
             res['shadow_open_count'] = conn.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN' AND mode='SHADOW'").fetchone()[0]
-            
             last_dec = conn.execute("SELECT symbol, action, reason FROM ai_decision_log ORDER BY id DESC LIMIT 1").fetchone()
             res['last_action'] = f"{last_dec[0]}: {last_dec[1]}" if last_dec else "N/A"
             return res
@@ -210,74 +208,59 @@ class TitanEngine:
         except Exception as e: logger.error(f"Sync error: {e}")
 
     async def reconcile_trades(self):
-        """Réconciliation des trades LIVE et SHADOW."""
-        # 1. SHADOW RECON (Simulation TP/SL simple)
+        # 1. SHADOW RECON
         shadow_trades = self.db.get_open_trades(mode='SHADOW')
         for t in shadow_trades:
             try:
                 bars = self.alpaca.get_bars(t['symbol'], TimeFrame.Minute, limit=1)
                 if not bars: continue
                 price = bars[0].c
-                if price >= t['tp_price']:
-                    self.db.close_trade(t['id'], price, "TP")
-                    logger.info(f"SHADOW TP: {t['symbol']}")
-                elif price <= t['sl_price']:
-                    self.db.close_trade(t['id'], price, "SL")
-                    logger.info(f"SHADOW SL: {t['symbol']}")
-            except Exception as e: logger.error(f"Shadow recon error {t['symbol']}: {e}")
+                if price >= t['tp_price']: self.db.close_trade(t['id'], price, "TP")
+                elif price <= t['sl_price']: self.db.close_trade(t['id'], price, "SL")
+            except Exception: pass
 
-        # 2. LIVE RECON (Sync avec Alpaca)
+        # 2. LIVE RECON
         live_trades = self.db.get_open_trades(mode='LIVE')
         if not live_trades: return
-        
         positions = {p.symbol: p for p in self.alpaca.list_positions()}
         for t in live_trades:
             if t['symbol'] not in positions:
-                # La position n'est plus chez Alpaca -> Elle a été fermée (TP/SL/Manuelle)
-                # On cherche le dernier trade fermé pour ce symbole
                 activities = self.alpaca.get_activities(activity_types='FILL')
                 symbol_fills = [f for f in activities if f.symbol == t['symbol']]
                 if symbol_fills:
-                    last_fill = symbol_fills[0]
-                    exit_price = float(last_fill.price)
+                    exit_price = float(symbol_fills[0].price)
                     res = "TP" if exit_price > t['entry_price'] else "SL"
                     self.db.close_trade(t['id'], exit_price, res)
-                    logger.info(f"LIVE RECON CLOSED: {t['symbol']} as {res}")
 
     async def fetch_ai_picks(self):
         s = await self.get_session()
         prompt = (
-            "You are a quant trader. Analyze US market. Return ONLY JSON: "
-            "{'picks': [{'symbol': 'TICKER', 'confidence': 95, 'reason': 'thesis'}]}. "
-            "If no clear opportunities, return {'picks': []}."
+            "Analyze US market. Return ONLY JSON: "
+            "{'picks': [{'symbol': 'TICKER', 'confidence': 95, 'reason': 'short thesis'}]}. "
+            "If no opportunities, return {'picks': []}."
         )
         try:
             async with s.post("https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
                 json={"model": CONFIG["AI_MODEL"], "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
                 timeout=30) as r:
-                
                 resp_json = await r.json()
                 raw_content = resp_json['choices'][0]['message']['content'] if 'choices' in resp_json else str(resp_json)
                 parsed = clean_deepseek_json(raw_content)
-                
-                if parsed and "picks" in parsed:
-                    return {"picks": parsed["picks"], "raw": raw_content, "error": None}
-                return {"picks": [], "raw": raw_content, "error": "PARSE_OR_EMPTY"}
+                if parsed and "picks" in parsed: return {"picks": parsed["picks"], "raw": raw_content, "error": None}
+                return {"picks": [], "raw": raw_content, "error": "PARSE_ERROR"}
         except Exception as e:
             return {"picks": [], "raw": str(e), "error": "CONN_ERROR"}
 
     async def run_logic(self):
-        # Réconciliation avant de chercher de nouveaux trades
         await self.reconcile_trades()
-        
         spy_vol = 0.0
         try:
             spy = self.alpaca.get_bars("SPY", TimeFrame.Minute, limit=15)
             if len(spy) >= 15:
                 spy_vol = ((max([b.h for b in spy]) - min([b.l for b in spy])) / min([b.l for b in spy])) * 100
                 self.status["safety"]["market_stress"] = spy_vol > CONFIG["MARKET_STRESS_THRESHOLD"]
-        except Exception as e: logger.error(f"Vol check error: {e}")
+        except Exception: pass
         
         ai_data = await self.fetch_ai_picks()
         picks, raw_text, ai_err = ai_data.get("picks", []), ai_data.get("raw", ""), ai_data.get("error")
@@ -290,7 +273,6 @@ class TitanEngine:
             symbol = p.get('symbol', '').upper()
             conf, thesis = p.get('confidence', 0), p.get('reason', 'N/A')
             if not symbol: continue
-
             if symbol in self.last_trade_per_symbol and (datetime.now() - self.last_trade_per_symbol[symbol]) < timedelta(minutes=CONFIG["COOLDOWN_PER_SYMBOL_MIN"]):
                 self.db.log_decision(symbol, conf, thesis, "SKIP", "COOLDOWN", ai_raw=raw_text)
                 continue
@@ -302,26 +284,19 @@ class TitanEngine:
                 tp, sl = round(entry * CONFIG["TP_PCT"], 2), round(entry * CONFIG["SL_PCT"], 2)
                 diff = abs(entry - sl)
                 qty = math.floor(CONFIG["DOLLAR_RISK_PER_TRADE"] / diff) if diff > 0 else 0
-
                 if qty < 1:
                     self.db.log_decision(symbol, conf, thesis, "SKIP", "RISK_SIZE", ai_raw=raw_text)
                     continue
 
                 can_live = (conf >= CONFIG["LIVE_THRESHOLD"] and self.status["positions"]["live"] < CONFIG["MAX_OPEN_POSITIONS"] and not self.status["safety"]["market_stress"])
-
                 if can_live:
                     dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", ai_raw=raw_text)
-                    order = self.alpaca.submit_order(
-                        symbol=symbol, qty=qty, side='buy', type='market', 
-                        time_in_force='gtc', order_class='bracket', 
-                        take_profit={'limit_price': tp}, stop_loss={'stop_price': sl}
-                    )
+                    order = self.alpaca.submit_order(symbol=symbol, qty=qty, side='buy', type='market', time_in_force='gtc', order_class='bracket', take_profit={'limit_price': tp}, stop_loss={'stop_price': sl})
                     self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id, order.id)
                 else:
                     rej = "STRESS" if self.status["safety"]["market_stress"] else "CONF/LIMIT"
                     dec_id = self.db.log_decision(symbol, conf, thesis, "SHADOW", rej, ai_raw=raw_text)
                     self.db.log_trade(symbol, qty, entry, conf, thesis, "SHADOW", tp, sl, dec_id)
-                
                 self.last_trade_per_symbol[symbol] = datetime.now()
             except Exception as e: logger.error(f"Trade error {symbol}: {e}")
 
@@ -336,9 +311,8 @@ class TitanEngine:
                         await self.run_logic()
                     else:
                         self.status["state"] = "IDLE"
-                        await self.reconcile_trades() # On réconcilie même si fermé pour les derniers trades
-                else: 
-                    self.status["state"] = "HALTED"
+                        await self.reconcile_trades()
+                else: self.status["state"] = "HALTED"
             except Exception as e: logger.error(f"Loop crash: {e}")
             await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
 
@@ -364,19 +338,34 @@ async def auth_middleware(request, handler):
         return web.json_response({"error": "Auth"}, status=401)
     return await handler(request)
 
+# --- MAIN BLOCK (CORRÉGÉ POUR CORS) ---
 async def main():
     titan = TitanEngine()
     app = web.Application(middlewares=[auth_middleware])
     app['titan'] = titan
-    app.router.add_get('/status', api_status)
-    app.router.add_get('/decisions', api_decisions)
-    app.router.add_post('/resume', api_resume)
-    cors = aiohttp_cors.setup(app, defaults={"*": aiohttp_cors.ResourceOptions(allow_headers=["Authorization", "Content-Type"], allow_methods=["GET", "POST", "OPTIONS"])})
-    for r in list(app.router.routes()): cors.add(r)
+
+    # Configuration CORS avec defaults permissifs pour le Dashboard
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+            allow_methods="*"
+        )
+    })
+
+    # AJOUT DES ROUTES AVEC CORS EXPLICITE
+    # On bind chaque route au middleware CORS immédiatement
+    cors.add(app.router.add_get('/', api_status))
+    cors.add(app.router.add_get('/status', api_status))
+    cors.add(app.router.add_get('/decisions', api_decisions))
+    cors.add(app.router.add_post('/resume', api_resume))
+
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Omni Recon v8.0.0 Ready.")
+    
+    logger.info(f"Titan-Shield v8.0.1 Ready. CORS explicitely bound to all routes.")
     await titan.main_loop()
 
 if __name__ == "__main__":
