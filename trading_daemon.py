@@ -20,9 +20,9 @@ API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 
 CONFIG = {
-    "VERSION": "7.9.12-OmniAudit-Plus",
+    "VERSION": "8.0.0-OmniRecon",
     "PORT": 8080,
-    "DB_PATH": "titan_v7_omni.db",
+    "DB_PATH": "titan_v8_recon.db",
     "MAX_OPEN_POSITIONS": 3,
     "DOLLAR_RISK_PER_TRADE": 50.0,
     "LIVE_THRESHOLD": 82,
@@ -38,15 +38,12 @@ CONFIG = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_omni.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_recon.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-Omni")
+logger = logging.getLogger("Titan-Recon")
 
 # --- UTILITAIRES DE PARSING ---
 def clean_deepseek_json(raw_text: str):
-    """
-    Nettoyage robuste des sorties DeepSeek (suppression <think> et markdown).
-    """
     if not raw_text: return None
     text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL)
     text = re.sub(r"```json", "", text, flags=re.IGNORECASE)
@@ -73,7 +70,7 @@ class TitanDatabase:
                     entry_time DATETIME DEFAULT CURRENT_TIMESTAMP, exit_time DATETIME,
                     result TEXT, confidence INTEGER, thesis TEXT, mode TEXT,
                     tp_price REAL, sl_price REAL, status TEXT DEFAULT 'OPEN',
-                    decision_id INTEGER
+                    decision_id INTEGER, alpaca_order_id TEXT
                 )
             """)
             conn.execute("""
@@ -91,17 +88,46 @@ class TitanDatabase:
             conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('halt_reason', '')")
             conn.commit()
 
-    def get_or_create_daily_stats(self, current_equity):
-        """Gère l'équité de départ pour le calcul du PnL journalier."""
-        today = date.today().isoformat()
+    def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id, order_id=None):
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute("SELECT start_equity FROM daily_stats WHERE day = ?", (today,)).fetchone()
-            if row:
-                return row[0]
-            else:
-                conn.execute("INSERT INTO daily_stats (day, start_equity) VALUES (?, ?)", (today, current_equity))
-                conn.commit()
-                return current_equity
+            conn.execute("""INSERT INTO trades 
+                (symbol, qty, entry_price, confidence, thesis, mode, tp_price, sl_price, status, decision_id, alpaca_order_id) 
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (symbol, qty, price, conf, thesis, mode, tp, sl, 'OPEN', dec_id, order_id))
+            conn.commit()
+
+    def close_trade(self, trade_id, exit_price, result):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                UPDATE trades SET status='CLOSED', exit_price=?, result=?, exit_time=CURRENT_TIMESTAMP 
+                WHERE id=?
+            """, (exit_price, result, trade_id))
+            conn.commit()
+
+    def get_open_trades(self, mode=None):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            if mode:
+                return conn.execute("SELECT * FROM trades WHERE status='OPEN' AND mode=?", (mode,)).fetchall()
+            return conn.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()
+
+    def get_stats(self):
+        with sqlite3.connect(self.db_path) as conn:
+            res = {'consecutive_sl': 0}
+            trades = conn.execute("SELECT result FROM trades WHERE mode='LIVE' AND status='CLOSED' ORDER BY id DESC LIMIT 5").fetchall()
+            for (r,) in trades:
+                if r == "SL": res['consecutive_sl'] += 1
+                else: break
+            res['decisions_today'] = conn.execute("SELECT COUNT(*) FROM ai_decision_log WHERE date(timestamp) = date('now')").fetchone()[0]
+            shadows = conn.execute("SELECT result FROM trades WHERE mode='SHADOW' AND status='CLOSED' AND date(exit_time) = date('now')").fetchall()
+            res['shadow_winrate'] = round((len([r for (r,) in shadows if r == 'TP']) / len(shadows) * 100), 2) if shadows else 0
+            
+            # Recalcul des positions ouvertes (Shadow & Live)
+            res['shadow_open_count'] = conn.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN' AND mode='SHADOW'").fetchone()[0]
+            
+            last_dec = conn.execute("SELECT symbol, action, reason FROM ai_decision_log ORDER BY id DESC LIMIT 1").fetchone()
+            res['last_action'] = f"{last_dec[0]}: {last_dec[1]}" if last_dec else "N/A"
+            return res
 
     def get_halt_state(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -115,6 +141,15 @@ class TitanDatabase:
             conn.execute("UPDATE system_state SET value = ? WHERE key = 'halt_reason'", (reason,))
             conn.commit()
 
+    def get_or_create_daily_stats(self, current_equity):
+        today = date.today().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("SELECT start_equity FROM daily_stats WHERE day = ?", (today,)).fetchone()
+            if row: return row[0]
+            conn.execute("INSERT INTO daily_stats (day, start_equity) VALUES (?, ?)", (today, current_equity))
+            conn.commit()
+            return current_equity
+
     def log_decision(self, symbol, conf, reason, action, filter_rejected="", ai_raw=""):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
@@ -123,28 +158,6 @@ class TitanDatabase:
             )
             conn.commit()
             return cursor.lastrowid
-
-    def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""INSERT INTO trades 
-                (symbol, qty, entry_price, confidence, thesis, mode, tp_price, sl_price, status, decision_id) 
-                VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (symbol, qty, price, conf, thesis, mode, tp, sl, 'OPEN', dec_id))
-            conn.commit()
-
-    def get_stats(self):
-        with sqlite3.connect(self.db_path) as conn:
-            res = {'consecutive_sl': 0}
-            trades = conn.execute("SELECT result FROM trades WHERE mode='LIVE' AND status='CLOSED' ORDER BY id DESC LIMIT 5").fetchall()
-            for (r,) in trades:
-                if r == "SL": res['consecutive_sl'] += 1
-                else: break
-            res['decisions_today'] = conn.execute("SELECT COUNT(*) FROM ai_decision_log WHERE date(timestamp) = date('now')").fetchone()[0]
-            shadows = conn.execute("SELECT result FROM trades WHERE mode='SHADOW' AND status='CLOSED' AND date(exit_time) = date('now')").fetchall()
-            res['shadow_winrate'] = round((len([r for (r,) in shadows if r == 'TP']) / len(shadows) * 100), 2) if shadows else 0
-            last_dec = conn.execute("SELECT symbol, action, reason FROM ai_decision_log ORDER BY id DESC LIMIT 1").fetchone()
-            res['last_action'] = f"{last_dec[0]}: {last_dec[1]}" if last_dec else "N/A"
-            return res
 
 # --- MOTEUR TITAN ---
 class TitanEngine:
@@ -178,55 +191,86 @@ class TitanEngine:
         try:
             acc = self.alpaca.get_account()
             eq = float(acc.equity)
-            
-            # --- RÉCUPÉRATION PNL JOURNALIER ---
             start_eq = self.db.get_or_create_daily_stats(eq)
             pnl_pct = ((eq - start_eq) / start_eq * 100) if start_eq > 0 else 0.0
             
             clock = self.alpaca.get_clock()
             stats = self.db.get_stats()
+            
             self.status.update({
                 "market": "OPEN" if clock.is_open else "CLOSED",
                 "equity": {"current": round(eq, 2), "pnl_pct": round(pnl_pct, 2)},
-                "positions": {"live": len(self.alpaca.list_positions())},
+                "positions": {
+                    "live": len(self.alpaca.list_positions()), 
+                    "shadow_open": stats['shadow_open_count']
+                },
                 "safety": {"consecutive_sl": stats['consecutive_sl']},
                 "omni": stats
             })
         except Exception as e: logger.error(f"Sync error: {e}")
 
+    async def reconcile_trades(self):
+        """Réconciliation des trades LIVE et SHADOW."""
+        # 1. SHADOW RECON (Simulation TP/SL simple)
+        shadow_trades = self.db.get_open_trades(mode='SHADOW')
+        for t in shadow_trades:
+            try:
+                bars = self.alpaca.get_bars(t['symbol'], TimeFrame.Minute, limit=1)
+                if not bars: continue
+                price = bars[0].c
+                if price >= t['tp_price']:
+                    self.db.close_trade(t['id'], price, "TP")
+                    logger.info(f"SHADOW TP: {t['symbol']}")
+                elif price <= t['sl_price']:
+                    self.db.close_trade(t['id'], price, "SL")
+                    logger.info(f"SHADOW SL: {t['symbol']}")
+            except Exception as e: logger.error(f"Shadow recon error {t['symbol']}: {e}")
+
+        # 2. LIVE RECON (Sync avec Alpaca)
+        live_trades = self.db.get_open_trades(mode='LIVE')
+        if not live_trades: return
+        
+        positions = {p.symbol: p for p in self.alpaca.list_positions()}
+        for t in live_trades:
+            if t['symbol'] not in positions:
+                # La position n'est plus chez Alpaca -> Elle a été fermée (TP/SL/Manuelle)
+                # On cherche le dernier trade fermé pour ce symbole
+                activities = self.alpaca.get_activities(activity_types='FILL')
+                symbol_fills = [f for f in activities if f.symbol == t['symbol']]
+                if symbol_fills:
+                    last_fill = symbol_fills[0]
+                    exit_price = float(last_fill.price)
+                    res = "TP" if exit_price > t['entry_price'] else "SL"
+                    self.db.close_trade(t['id'], exit_price, res)
+                    logger.info(f"LIVE RECON CLOSED: {t['symbol']} as {res}")
+
     async def fetch_ai_picks(self):
         s = await self.get_session()
         prompt = (
-            "You are a quantitative trading assistant. Analyze current US market trends. "
-            "Return ONLY a JSON object with this structure: "
-            "{'picks': [{'symbol': 'TICKER', 'confidence': 95, 'reason': 'short thesis'}]}. "
+            "You are a quant trader. Analyze US market. Return ONLY JSON: "
+            "{'picks': [{'symbol': 'TICKER', 'confidence': 95, 'reason': 'thesis'}]}. "
             "If no clear opportunities, return {'picks': []}."
         )
         try:
             async with s.post("https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-                json={
-                    "model": CONFIG["AI_MODEL"], 
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3
-                },
+                json={"model": CONFIG["AI_MODEL"], "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
                 timeout=30) as r:
                 
                 resp_json = await r.json()
-                if 'choices' not in resp_json:
-                    return {"picks": [], "raw": str(resp_json), "error": "API_ERROR"}
-                
-                raw_content = resp_json['choices'][0]['message']['content']
+                raw_content = resp_json['choices'][0]['message']['content'] if 'choices' in resp_json else str(resp_json)
                 parsed = clean_deepseek_json(raw_content)
                 
                 if parsed and "picks" in parsed:
                     return {"picks": parsed["picks"], "raw": raw_content, "error": None}
-                else:
-                    return {"picks": [], "raw": raw_content, "error": "PARSE_ERROR"}
+                return {"picks": [], "raw": raw_content, "error": "PARSE_OR_EMPTY"}
         except Exception as e:
             return {"picks": [], "raw": str(e), "error": "CONN_ERROR"}
 
     async def run_logic(self):
+        # Réconciliation avant de chercher de nouveaux trades
+        await self.reconcile_trades()
+        
         spy_vol = 0.0
         try:
             spy = self.alpaca.get_bars("SPY", TimeFrame.Minute, limit=15)
@@ -236,20 +280,15 @@ class TitanEngine:
         except Exception as e: logger.error(f"Vol check error: {e}")
         
         ai_data = await self.fetch_ai_picks()
-        picks = ai_data.get("picks", [])
-        raw_text = ai_data.get("raw", "")
-        ai_err = ai_data.get("error")
+        picks, raw_text, ai_err = ai_data.get("picks", []), ai_data.get("raw", ""), ai_data.get("error")
 
-        # --- HEARTBEAT AMÉLIORÉ ---
         if not picks:
-            reason = "NO_PICKS" if not ai_err else ai_err
-            self.db.log_decision("SYSTEM", 0, f"Heartbeat (Vol: {round(spy_vol,2)}%). Reason: {reason}", "IDLE", ai_raw=raw_text)
+            self.db.log_decision("SYSTEM", 0, f"Heartbeat (Vol:{round(spy_vol,2)}%). Info: {ai_err or 'No picks'}", "IDLE", ai_raw=raw_text)
             return
 
         for p in picks:
             symbol = p.get('symbol', '').upper()
-            conf = p.get('confidence', 0)
-            thesis = p.get('reason', 'N/A')
+            conf, thesis = p.get('confidence', 0), p.get('reason', 'N/A')
             if not symbol: continue
 
             if symbol in self.last_trade_per_symbol and (datetime.now() - self.last_trade_per_symbol[symbol]) < timedelta(minutes=CONFIG["COOLDOWN_PER_SYMBOL_MIN"]):
@@ -259,7 +298,6 @@ class TitanEngine:
             try:
                 bars = self.alpaca.get_bars(symbol, TimeFrame.Minute, limit=1)
                 if not bars: continue
-                
                 entry = bars[0].c
                 tp, sl = round(entry * CONFIG["TP_PCT"], 2), round(entry * CONFIG["SL_PCT"], 2)
                 diff = abs(entry - sl)
@@ -273,12 +311,12 @@ class TitanEngine:
 
                 if can_live:
                     dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", ai_raw=raw_text)
-                    self.alpaca.submit_order(
+                    order = self.alpaca.submit_order(
                         symbol=symbol, qty=qty, side='buy', type='market', 
                         time_in_force='gtc', order_class='bracket', 
                         take_profit={'limit_price': tp}, stop_loss={'stop_price': sl}
                     )
-                    self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id)
+                    self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id, order.id)
                 else:
                     rej = "STRESS" if self.status["safety"]["market_stress"] else "CONF/LIMIT"
                     dec_id = self.db.log_decision(symbol, conf, thesis, "SHADOW", rej, ai_raw=raw_text)
@@ -296,12 +334,12 @@ class TitanEngine:
                     if self.status["market"] == "OPEN":
                         self.status["state"] = "SCANNING"
                         await self.run_logic()
-                    else: 
+                    else:
                         self.status["state"] = "IDLE"
+                        await self.reconcile_trades() # On réconcilie même si fermé pour les derniers trades
                 else: 
                     self.status["state"] = "HALTED"
-            except Exception as e:
-                logger.error(f"Loop crash: {e}")
+            except Exception as e: logger.error(f"Loop crash: {e}")
             await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
 
 # --- API ENDPOINTS ---
@@ -338,7 +376,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Omni Plus v7.9.12 Ready.")
+    logger.info(f"Titan-Omni Recon v8.0.0 Ready.")
     await titan.main_loop()
 
 if __name__ == "__main__":
