@@ -14,14 +14,14 @@ from alpaca_trade_api.rest import TimeFrame
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.1 ---
+# --- CONFIGURATION V8.2 ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 
 CONFIG = {
-    "VERSION": "8.1.0-ATR-Dynamic",
+    "VERSION": "8.2.0-Context-Aware",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     "MAX_OPEN_POSITIONS": 3,
@@ -29,10 +29,14 @@ CONFIG = {
     "LIVE_THRESHOLD": 82,
     "MARKET_STRESS_THRESHOLD": 1.5,
     "COOLDOWN_PER_SYMBOL_MIN": 15,
-    # --- NOUVEAUX PARAMETRES ATR (v8.1) ---
-    "ATR_PERIOD": 14,          # Période de calcul
-    "ATR_MULT_SL": 1.5,        # Le prix doit bouger de 1.5x la volatilité moyenne contre nous pour SL
-    "ATR_MULT_TP": 2.5,        # Objectif : 2.5x la volatilité (Risk:Reward ratio ~1.66)
+    # --- PARAMETRES ATR & REGIME (v8.2) ---
+    "ATR_PERIOD": 14,
+    # Les multiplicateurs sont maintenant dynamiques selon le régime
+    "REGIME_CONFIG": {
+        "TREND": {"TP_MULT": 3.0, "SL_MULT": 1.5, "DESC": "Trend following"},
+        "RANGE": {"TP_MULT": 1.5, "SL_MULT": 1.0, "DESC": "Mean reversion"},
+        "CHOP":  {"TP_MULT": 0.0, "SL_MULT": 0.0, "DESC": "No trade zone"} 
+    },
     # --------------------------------------
     "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
     "AI_MODEL": "deepseek/deepseek-v3.2",
@@ -42,13 +46,12 @@ CONFIG = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_1.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_2.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-ATR")
+logger = logging.getLogger("Titan-Context")
 
 # --- UTILITAIRES DE PARSING ---
 def clean_deepseek_json(raw_text: str):
-    """Nettoyage robuste des sorties JSON (DeepSeek)."""
     if not raw_text: return None
     text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL)
     text = re.sub(r"```json", "", text, flags=re.IGNORECASE)
@@ -60,12 +63,12 @@ def clean_deepseek_json(raw_text: str):
     except json.JSONDecodeError:
         return None
 
-# --- PERSISTANCE (V8.1) ---
+# --- PERSISTANCE (V8.2) ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
         self._init_db()
-        self._migrate_v8_1()
+        self._migrate_v8_2()
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -76,7 +79,8 @@ class TitanDatabase:
                     entry_time DATETIME DEFAULT CURRENT_TIMESTAMP, exit_time DATETIME,
                     result TEXT, confidence INTEGER, thesis TEXT, mode TEXT,
                     tp_price REAL, sl_price REAL, status TEXT DEFAULT 'OPEN',
-                    decision_id INTEGER, alpaca_order_id TEXT
+                    decision_id INTEGER, alpaca_order_id TEXT,
+                    atr_at_entry REAL
                 )
             """)
             conn.execute("""
@@ -94,21 +98,26 @@ class TitanDatabase:
             conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('halt_reason', '')")
             conn.commit()
 
-    def _migrate_v8_1(self):
-        """Migration non-destructive pour ajouter les colonnes ATR."""
+    def _migrate_v8_2(self):
+        """Migration v8.2: Ajout colonne Regime."""
         with sqlite3.connect(self.db_path) as conn:
+            # v8.1 column
             try:
                 conn.execute("ALTER TABLE trades ADD COLUMN atr_at_entry REAL")
-                logger.info("Migration DB: Colonne 'atr_at_entry' ajoutée.")
-            except sqlite3.OperationalError:
-                pass # Colonne déjà existante
+            except sqlite3.OperationalError: pass
+            
+            # v8.2 column
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN market_regime TEXT")
+                logger.info("Migration DB: Colonne 'market_regime' ajoutée.")
+            except sqlite3.OperationalError: pass
 
-    def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id, order_id=None, atr=0.0):
+    def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id, order_id=None, atr=0.0, regime="UNKNOWN"):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""INSERT INTO trades 
-                (symbol, qty, entry_price, confidence, thesis, mode, tp_price, sl_price, status, decision_id, alpaca_order_id, atr_at_entry) 
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (symbol, qty, price, conf, thesis, mode, tp, sl, 'OPEN', dec_id, order_id, atr))
+                (symbol, qty, entry_price, confidence, thesis, mode, tp_price, sl_price, status, decision_id, alpaca_order_id, atr_at_entry, market_regime) 
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (symbol, qty, price, conf, thesis, mode, tp, sl, 'OPEN', dec_id, order_id, atr, regime))
             conn.commit()
 
     def close_trade(self, trade_id, exit_price, result):
@@ -199,23 +208,53 @@ class TitanEngine:
             self.session = aiohttp.ClientSession()
         return self.session
 
-    def calculate_atr(self, bars, period=14):
-        """Calcul de l'Average True Range sur les bougies fournies."""
-        if len(bars) < period + 1:
-            return 0.0
+    def _calculate_sma(self, prices, period):
+        if len(prices) < period: return None
+        return sum(prices[-period:]) / period
+
+    def analyze_market_regime(self, bars):
+        """
+        Détermine le régime de marché (TREND, RANGE, CHOP).
+        Utilise SMA Alignment et Volatilité relative.
+        """
+        if len(bars) < 50: return "UNCERTAIN" # Besoin d'historique pour SMA50
+
+        prices = [b.c for b in bars]
         
+        sma20 = self._calculate_sma(prices, 20)
+        sma50 = self._calculate_sma(prices, 50)
+        
+        if not sma20 or not sma50: return "UNCERTAIN"
+
+        current_price = prices[-1]
+        
+        # 1. Trend Filter: Alignement SMA
+        # Uptrend: Prix > SMA20 > SMA50
+        is_uptrend = current_price > sma20 > sma50
+        # Downtrend: Prix < SMA20 < SMA50
+        is_downtrend = current_price < sma20 < sma50
+        
+        # 2. Volatility Context (Range vs Trend strength)
+        # On regarde si les SMAs sont proches (Compression/Range) ou écartées (Expansion/Trend)
+        sma_spread = abs(sma20 - sma50) / sma50 * 100
+        
+        if sma_spread < 0.5: 
+            # SMAs très proches = Compression = RANGE ou CHOP
+            # Si le prix oscille autour des SMAs sans direction claire
+            return "RANGE"
+        elif is_uptrend or is_downtrend:
+            return "TREND"
+        else:
+            return "CHOP" # Désordre (Prix > SMA50 mais < SMA20 etc.)
+
+    def calculate_atr(self, bars, period=14):
+        if len(bars) < period + 1: return 0.0
         tr_list = []
         for i in range(1, len(bars)):
-            h = bars[i].h
-            l = bars[i].l
-            prev_c = bars[i-1].c
-            
+            h, l, prev_c = bars[i].h, bars[i].l, bars[i-1].c
             tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
             tr_list.append(tr)
-            
-        # Moyenne Simple des TR pour l'ATR (suffisant pour v8.1)
-        if len(tr_list) < period:
-            return 0.0
+        if len(tr_list) < period: return 0.0
         return statistics.mean(tr_list[-period:])
 
     async def sync_data(self):
@@ -241,7 +280,7 @@ class TitanEngine:
         except Exception as e: logger.error(f"Sync error: {e}")
 
     async def reconcile_trades(self):
-        # 1. SHADOW RECON (Simulation)
+        # 1. SHADOW RECON
         shadow_trades = self.db.get_open_trades(mode='SHADOW')
         for t in shadow_trades:
             try:
@@ -252,57 +291,38 @@ class TitanEngine:
                 elif price <= t['sl_price']: self.db.close_trade(t['id'], price, "SL")
             except Exception: pass
 
-        # 2. LIVE RECON (V8.1 Améliorée)
+        # 2. LIVE RECON
         live_trades = self.db.get_open_trades(mode='LIVE')
         if not live_trades: return
         
         positions = {p.symbol: p for p in self.alpaca.list_positions()}
         
         for t in live_trades:
-            # Cas 1: Position toujours ouverte chez Alpaca -> On ne fait rien
-            if t['symbol'] in positions:
-                continue
+            if t['symbol'] in positions: continue
 
-            # Cas 2: Position absente -> Vérification Order Status ou Fills
-            # Priorité aux Fills pour avoir le prix exact
+            # Vérification Fills et Statut Ordre
             activities = self.alpaca.get_activities(activity_types='FILL')
             symbol_fills = [f for f in activities if f.symbol == t['symbol']]
             
-            # Vérifier si l'ordre original a été annulé/rejeté (Pas de Fill récent)
             if t['alpaca_order_id']:
                 try:
                     order = self.alpaca.get_order(t['alpaca_order_id'])
                     if order.status in ['canceled', 'expired', 'rejected']:
                         self.db.close_trade(t['id'], 0, "VOID")
-                        logger.warning(f"Trade {t['symbol']} annulé/rejeté par le broker. Marqué VOID.")
                         continue
-                except Exception:
-                    pass
+                except Exception: pass
 
             if symbol_fills:
-                # Trouver le fill de sortie (Sell si Long) le plus récent
-                # Note: Simplification, prend le dernier fill. v9 devra gérer les ID exacts.
                 exit_price = float(symbol_fills[0].price) 
-                
-                # Détermination TP/SL basée sur le prix
-                if exit_price >= t['entry_price']:
-                    res = "TP"
-                else:
-                    res = "SL"
-                
+                res = "TP" if exit_price >= t['entry_price'] else "SL"
                 self.db.close_trade(t['id'], exit_price, res)
-            else:
-                # Cas 3: Ni position, ni fill, ni annulé ? Anomalie.
-                # On ne ferme pas automatiquement pour enquête manuelle, sauf si trade très vieux.
-                pass
 
     async def fetch_ai_picks(self):
         s = await self.get_session()
-        # Prompt enrichi mais concis pour v8.1
         prompt = (
             "Analyze US market structure. Return ONLY JSON: "
             "{'picks': [{'symbol': 'TICKER', 'confidence': 95, 'reason': 'short thesis'}]}. "
-            "Identify high probability setups. If undefined, return {'picks': []}."
+            "Identify high probability setups."
         )
         try:
             async with s.post("https://openrouter.ai/api/v1/chat/completions",
@@ -320,99 +340,86 @@ class TitanEngine:
     async def run_logic(self):
         await self.reconcile_trades()
         
-        # 1. Analyse Volatilité Marché Global (SPY)
+        # 1. Market Stress Check
         spy_vol = 0.0
         try:
             spy = self.alpaca.get_bars("SPY", TimeFrame.Minute, limit=20)
             if len(spy) >= 15:
-                # Volatilité simple sur le range des 15 dernières minutes
-                highs = [b.h for b in spy]
-                lows = [b.l for b in spy]
-                spy_vol = ((max(highs) - min(lows)) / min(lows)) * 100
+                spy_vol = ((max([b.h for b in spy]) - min([b.l for b in spy])) / min([b.l for b in spy])) * 100
                 self.status["safety"]["market_stress"] = spy_vol > CONFIG["MARKET_STRESS_THRESHOLD"]
         except Exception: pass
         
-        # 2. Appel IA
         ai_data = await self.fetch_ai_picks()
-        picks, raw_text, ai_err = ai_data.get("picks", []), ai_data.get("raw", ""), ai_data.get("error")
+        picks, raw_text = ai_data.get("picks", []), ai_data.get("raw", "")
 
         if not picks:
-            self.db.log_decision("SYSTEM", 0, f"Heartbeat (SPY Vol:{round(spy_vol,2)}%). Info: {ai_err or 'No picks'}", "IDLE", ai_raw=raw_text)
+            self.db.log_decision("SYSTEM", 0, f"Heartbeat (Vol:{round(spy_vol,2)}%).", "IDLE", ai_raw=raw_text)
             return
 
-        # 3. Traitement des picks avec ATR DYNAMIQUE
         for p in picks:
             symbol = p.get('symbol', '').upper()
             conf, thesis = p.get('confidence', 0), p.get('reason', 'N/A')
-            
             if not symbol: continue
             
-            # Cooldown check
             if symbol in self.last_trade_per_symbol and (datetime.now() - self.last_trade_per_symbol[symbol]) < timedelta(minutes=CONFIG["COOLDOWN_PER_SYMBOL_MIN"]):
                 self.db.log_decision(symbol, conf, thesis, "SKIP", "COOLDOWN", ai_raw=raw_text)
                 continue
 
             try:
-                # Récupération données pour ATR (20 bougies pour en avoir 14 valides)
-                bars = self.alpaca.get_bars(symbol, TimeFrame.Minute, limit=30)
-                if not bars or len(bars) < CONFIG["ATR_PERIOD"] + 2:
+                # 2. Context Analysis (v8.2: Besoin de 60 bars pour SMA50 + ATR)
+                bars = self.alpaca.get_bars(symbol, TimeFrame.Minute, limit=60)
+                if not bars or len(bars) < 55:
                     self.db.log_decision(symbol, conf, thesis, "SKIP", "NO_DATA", ai_raw=raw_text)
                     continue
 
                 entry = bars[-1].c
                 atr = self.calculate_atr(bars, period=CONFIG["ATR_PERIOD"])
-                
-                if atr == 0:
-                    self.db.log_decision(symbol, conf, thesis, "SKIP", "ATR_ZERO", ai_raw=raw_text)
-                    continue
+                regime = self.analyze_market_regime(bars) # Nouveau en v8.2
 
-                # --- CALCUL DYNAMIQUE V8.1 ---
-                sl_dist = atr * CONFIG["ATR_MULT_SL"]
-                tp_dist = atr * CONFIG["ATR_MULT_TP"]
+                if atr == 0: continue
+
+                # 3. Regime-based Parameters
+                if regime == "CHOP":
+                    self.db.log_decision(symbol, conf, thesis, "SKIP", "REGIME_CHOP", ai_raw=raw_text)
+                    continue
+                
+                # Sélection des multiplicateurs selon le régime
+                regime_settings = CONFIG["REGIME_CONFIG"].get(regime, CONFIG["REGIME_CONFIG"]["RANGE"])
+                tp_mult = regime_settings["TP_MULT"]
+                sl_mult = regime_settings["SL_MULT"]
+
+                sl_dist = atr * sl_mult
+                tp_dist = atr * tp_mult
                 
                 tp = round(entry + tp_dist, 2)
                 sl = round(entry - sl_dist, 2)
                 
-                # Protection absurdité (Spread trop large ou bug data)
-                if sl_dist < (entry * 0.001): # SL trop serré (< 0.1%)
-                     self.db.log_decision(symbol, conf, thesis, "SKIP", "LOW_VOL_NO_ROOM", ai_raw=raw_text)
-                     continue
+                if sl_dist < (entry * 0.001): continue # SL trop serré
 
-                # Risk Sizing Dynamique (Iso-Risk)
-                # On risque toujours DOLLAR_RISK_PER_TRADE, peu importe la volatilité
+                # Risk Sizing
                 qty = math.floor(CONFIG["DOLLAR_RISK_PER_TRADE"] / sl_dist)
-                
-                if qty < 1:
-                    self.db.log_decision(symbol, conf, thesis, "SKIP", "RISK_SIZE_TOO_SMALL", ai_raw=raw_text)
-                    continue
+                if qty < 1: continue
 
-                # Filtres de passage en LIVE
+                # 4. Décision & Execution
                 can_live = (conf >= CONFIG["LIVE_THRESHOLD"] and 
                            self.status["positions"]["live"] < CONFIG["MAX_OPEN_POSITIONS"] and 
                            not self.status["safety"]["market_stress"])
                 
+                log_msg = f"Regime:{regime} ATR:{round(atr,2)}"
+
                 if can_live:
-                    dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", f"ATR:{round(atr,2)}", ai_raw=raw_text)
-                    
-                    # Ordre Bracket chez Alpaca
+                    dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", log_msg, ai_raw=raw_text)
                     order = self.alpaca.submit_order(
-                        symbol=symbol, 
-                        qty=qty, 
-                        side='buy', 
-                        type='market', 
-                        time_in_force='gtc', 
+                        symbol=symbol, qty=qty, side='buy', type='market', time_in_force='gtc', 
                         order_class='bracket', 
-                        take_profit={'limit_price': tp}, 
-                        stop_loss={'stop_price': sl}
+                        take_profit={'limit_price': tp}, stop_loss={'stop_price': sl}
                     )
-                    
-                    self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id, order.id, atr)
-                    logger.info(f"LIVE TRADE: {symbol} Qty:{qty} Entry:{entry} TP:{tp} SL:{sl} (ATR:{round(atr,2)})")
-                    
+                    self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id, order.id, atr, regime)
+                    logger.info(f"LIVE [{regime}]: {symbol} Qty:{qty} TP:{tp} SL:{sl}")
                 else:
                     rej = "STRESS" if self.status["safety"]["market_stress"] else "CONF/LIMIT"
-                    dec_id = self.db.log_decision(symbol, conf, thesis, "SHADOW", rej, ai_raw=raw_text)
-                    self.db.log_trade(symbol, qty, entry, conf, thesis, "SHADOW", tp, sl, dec_id, order_id=None, atr=atr)
+                    dec_id = self.db.log_decision(symbol, conf, thesis, "SHADOW", f"{rej} ({log_msg})", ai_raw=raw_text)
+                    self.db.log_trade(symbol, qty, entry, conf, thesis, "SHADOW", tp, sl, dec_id, None, atr, regime)
                 
                 self.last_trade_per_symbol[symbol] = datetime.now()
                 
@@ -436,16 +443,13 @@ class TitanEngine:
             await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
 
 # --- API ENDPOINTS ---
-async def api_status(request): 
-    return web.json_response(request.app['titan'].status)
-
+async def api_status(request): return web.json_response(request.app['titan'].status)
 async def api_decisions(request):
     limit = int(request.query.get("limit", 20))
     with sqlite3.connect(CONFIG["DB_PATH"]) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM ai_decision_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return web.json_response([dict(r) for r in rows])
-
 async def api_resume(request):
     request.app['titan'].db.set_halt_state(False)
     return web.json_response({"status": "resumed"})
@@ -457,31 +461,19 @@ async def auth_middleware(request, handler):
         return web.json_response({"error": "Auth"}, status=401)
     return await handler(request)
 
-# --- MAIN BLOCK ---
 async def main():
     titan = TitanEngine()
     app = web.Application(middlewares=[auth_middleware])
     app['titan'] = titan
-
-    cors = aiohttp_cors.setup(app, defaults={
-        "*": aiohttp_cors.ResourceOptions(
-            allow_credentials=True,
-            expose_headers="*",
-            allow_headers="*",
-            allow_methods="*"
-        )
-    })
-
+    cors = aiohttp_cors.setup(app, defaults={"*": aiohttp_cors.ResourceOptions(allow_credentials=True, expose_headers="*", allow_headers="*", allow_methods="*")})
     cors.add(app.router.add_get('/', api_status))
     cors.add(app.router.add_get('/status', api_status))
     cors.add(app.router.add_get('/decisions', api_decisions))
     cors.add(app.router.add_post('/resume', api_resume))
-
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    
-    logger.info(f"Titan-ATR v8.1 Ready. Dynamic Risk Sizing Active.")
+    logger.info(f"Titan-Context v8.2 Ready. Regime Detection Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
