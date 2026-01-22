@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.5.3 ---
+# --- CONFIGURATION V8.5.5 ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,7 +22,7 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 
 CONFIG = {
-    "VERSION": "8.5.3-Broker-Hygiene",
+    "VERSION": "8.5.5-Visibility-Fixed",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     "MAX_OPEN_POSITIONS": 3,
@@ -47,9 +47,7 @@ CONFIG = {
     "MAX_SL_UPDATES_PER_TRADE": 20,
     "HEARTBEAT_INTERVAL_MIN": 60,
     "NOTIFY_LEVEL": "INFO",
-    # --- BROKER HYGIENE (v8.5.3) ---
-    "MIN_SL_DISTANCE_USD": 0.05, # Minimum 5 cents de SL pour éviter rejet broker
-    # -------------------------------
+    "MIN_SL_DISTANCE_USD": 0.05,
     "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
     "AI_MODEL": "deepseek/deepseek-v3.2",
     "SCAN_INTERVAL": 60 
@@ -58,9 +56,9 @@ CONFIG = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_5_3.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_5_5.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-Hygiene")
+logger = logging.getLogger("Titan-VisibilityFixed")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -171,12 +169,12 @@ class AdaptiveManager:
         elif regime == "RANGE": return "RANGE_SCALP"
         return "STANDARD"
 
-# --- PERSISTANCE (V8.5.3) ---
+# --- PERSISTANCE (V8.5.5) ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
         self._init_db()
-        self._migrate_v8_5_3()
+        self._migrate_v8_5_5()
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -210,8 +208,8 @@ class TitanDatabase:
             conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('halt_reason', '')")
             conn.commit()
 
-    def _migrate_v8_5_3(self):
-        pass # No schema change
+    def _migrate_v8_5_5(self):
+        pass 
 
     def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id, order_id=None, atr=0.0, regime="UNKNOWN"):
         with sqlite3.connect(self.db_path) as conn:
@@ -266,7 +264,10 @@ class TitanDatabase:
             res['decisions_today'] = conn.execute("SELECT COUNT(*) FROM ai_decision_log WHERE date(timestamp) = date('now')").fetchone()[0]
             shadows = conn.execute("SELECT result FROM trades WHERE mode='SHADOW' AND status='CLOSED' AND date(exit_time) = date('now')").fetchall()
             res['shadow_winrate'] = round((len([r for (r,) in shadows if r == 'TP']) / len(shadows) * 100), 2) if shadows else 0
+            
+            # Compteurs séparés
             res['shadow_open_count'] = conn.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN' AND mode='SHADOW'").fetchone()[0]
+            res['live_open_count'] = conn.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN' AND mode='LIVE'").fetchone()[0]
             return res
 
     def get_halt_state(self):
@@ -321,7 +322,7 @@ class TitanEngine:
             "halt_reason": reason,
             "equity": {"current": 0.0, "pnl_pct": 0.0},
             "safety": {"consecutive_sl": 0, "market_stress": False},
-            "positions": {"live": 0, "shadow_open": 0},
+            "positions": {"live_broker": 0, "live_titan": 0, "shadow_open": 0},
             "omni": {"decisions_today": 0, "shadow_winrate": 0, "last_action": "N/A"}
         }
 
@@ -385,7 +386,12 @@ class TitanEngine:
             self.status.update({
                 "market": "OPEN" if is_open else "CLOSED",
                 "equity": {"current": round(eq, 2), "pnl_pct": round(pnl_pct, 2)},
-                "positions": {"live": len(self.alpaca.list_positions()), "shadow_open": stats['shadow_open_count']},
+                # Dual Counters
+                "positions": {
+                    "live_broker": len(self.alpaca.list_positions()), 
+                    "live_titan": stats['live_open_count'],           
+                    "shadow_open": stats['shadow_open_count']
+                },
                 "safety": {"consecutive_sl": stats['consecutive_sl']},
                 "omni": stats
             })
@@ -604,9 +610,11 @@ class TitanEngine:
                 qty = math.floor(CONFIG["DOLLAR_RISK_PER_TRADE"] / sl_dist)
                 if qty < 1: continue
 
+                # --- V8.5.5 PATCH: Utilisation de live_titan pour le Gating ---
                 can_live = (conf >= CONFIG["LIVE_THRESHOLD"] and 
-                           self.status["positions"]["live"] < CONFIG["MAX_OPEN_POSITIONS"] and 
+                           self.status["positions"]["live_titan"] < CONFIG["MAX_OPEN_POSITIONS"] and 
                            not self.status["safety"]["market_stress"])
+                # --------------------------------------------------------------
                 
                 log_msg = f"Regime:{regime} ATR:{round(atr,2)}"
 
@@ -621,7 +629,6 @@ class TitanEngine:
                             take_profit={'limit_price': tp}, stop_loss={'stop_price': sl}
                         )
                     except APIError as e:
-                        # Rejet technique immédiat (ex: "stop price too close")
                         self.db.log_decision(symbol, conf, thesis, "LIVE_API_ERROR", str(e), ai_raw=raw_text)
                         await self.notifier.send_rejection(symbol, "API_ERROR", str(e))
                         continue
@@ -694,7 +701,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Hygiene v8.5.3 Ready. Broker Safe.")
+    logger.info(f"Titan-VisibilityFixed v8.5.5 Ready. Logic Gating Corrected.")
     await titan.main_loop()
 
 if __name__ == "__main__":
