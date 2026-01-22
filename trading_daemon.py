@@ -10,11 +10,11 @@ import statistics
 from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 import alpaca_trade_api as tradeapi
-from alpaca_trade_api.rest import TimeFrame
+from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.5.1 ---
+# --- CONFIGURATION V8.5.3 ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,7 +22,7 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 
 CONFIG = {
-    "VERSION": "8.5.1-Frozen-Adaptive",
+    "VERSION": "8.5.3-Broker-Hygiene",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     "MAX_OPEN_POSITIONS": 3,
@@ -36,20 +36,20 @@ CONFIG = {
         "RANGE": {"TP_MULT": 1.5, "SL_MULT": 1.0, "DESC": "Mean reversion", "TRAILING": False},
         "CHOP":  {"TP_MULT": 0.0, "SL_MULT": 0.0, "DESC": "No trade zone", "TRAILING": False} 
     },
-    # Valeurs par défaut (Fallback)
     "BE_TRIGGER_ATR": 1.0,
     "TRAILING_STEP_ATR": 0.5,
-    # --- ADAPTIVE GOVERNOR (v8.5.1 Fixed) ---
     "ENABLE_ADAPTIVE_GOVERNOR": True,
-    "ENABLE_ADAPTIVE_SHADOW": False,     # Si False, Shadow reste en mode v8.4 (Statique) pour comparaison
+    "ENABLE_ADAPTIVE_SHADOW": False,
     "VOLATILITY_HIGH_THRESHOLD": 0.005,
     "VOLATILITY_LOW_THRESHOLD": 0.001,
-    # ----------------------------------------
     "MAX_DAILY_DRAWDOWN_PCT": -4.0,
     "MAX_LOSSES_PER_SYMBOL": 2,
     "MAX_SL_UPDATES_PER_TRADE": 20,
     "HEARTBEAT_INTERVAL_MIN": 60,
     "NOTIFY_LEVEL": "INFO",
+    # --- BROKER HYGIENE (v8.5.3) ---
+    "MIN_SL_DISTANCE_USD": 0.05, # Minimum 5 cents de SL pour éviter rejet broker
+    # -------------------------------
     "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
     "AI_MODEL": "deepseek/deepseek-v3.2",
     "SCAN_INTERVAL": 60 
@@ -58,9 +58,9 @@ CONFIG = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_5_1.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_5_3.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-Frozen")
+logger = logging.getLogger("Titan-Hygiene")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -91,6 +91,7 @@ class NotificationManager:
         if priority == "CRITICAL": color = 0xe74c3c 
         elif priority == "TRADE": color = 0x2ecc71    
         elif priority == "WARNING": color = 0xf1c40f
+        elif priority == "ERROR": color = 0xe67e22 
         
         payload = {
             "embeds": [{
@@ -122,34 +123,34 @@ class NotificationManager:
 
     async def send_halt(self, reason):
         await self.send("🛑 SYSTEM HALTED", f"@here **Risk Governor Triggered**\nReason: {reason}", priority="CRITICAL")
+        
+    async def send_rejection(self, symbol, status, reason):
+        await self.send(f"⚠️ Order Rejected: {symbol}", f"**Status:** {status}\n**Reason:** {reason}", priority="ERROR")
 
-# --- ADAPTIVE MANAGER (v8.5.1 - FROZEN) ---
+# --- ADAPTIVE MANAGER (Frozen) ---
 class AdaptiveManager:
-    """Gestionnaire de profils de risque déterministes."""
-    
-    # Définition des profils statiques pour garantir la reproductibilité
     PROFILES = {
         "STANDARD": {
             "be_trigger": CONFIG["BE_TRIGGER_ATR"],
             "trailing_step": CONFIG["TRAILING_STEP_ATR"],
-            "trailing_mult_offset": 0.0, # Pas de changement du SL_MULT de base
+            "trailing_mult_offset": 0.0,
             "desc": "Standard v8.4"
         },
-        "TREND_HV": { # High Volatility
-            "be_trigger": 1.5,  # On laisse respirer (+50%)
-            "trailing_step": 0.8, # Trailing lent
-            "trailing_mult_offset": 0.5, # SL plus large (ex: 1.5 -> 2.0 ATR)
+        "TREND_HV": { 
+            "be_trigger": 1.5,
+            "trailing_step": 0.8,
+            "trailing_mult_offset": 0.5,
             "desc": "Trend High Vol (Loose)"
         },
-        "TREND_LV": { # Low Volatility
-            "be_trigger": 0.8,  # On sécurise vite
-            "trailing_step": 0.3, # Trailing serré
-            "trailing_mult_offset": -0.2, # SL plus serré (ex: 1.5 -> 1.3 ATR)
+        "TREND_LV": { 
+            "be_trigger": 0.8,
+            "trailing_step": 0.3,
+            "trailing_mult_offset": -0.2,
             "desc": "Trend Low Vol (Tight)"
         },
         "RANGE_SCALP": {
             "be_trigger": 0.8,
-            "trailing_step": 0.0, # Pas de trailing
+            "trailing_step": 0.0,
             "trailing_mult_offset": 0.0,
             "desc": "Range Scalp"
         }
@@ -157,35 +158,25 @@ class AdaptiveManager:
 
     @staticmethod
     def get_profile(code):
-        """Récupère un profil figé par son code."""
         return AdaptiveManager.PROFILES.get(code, AdaptiveManager.PROFILES["STANDARD"])
 
     @staticmethod
     def compute_new_profile_code(current_price, atr, regime):
-        """Détermine le code du profil à utiliser au moment de l'initialisation."""
-        if not CONFIG["ENABLE_ADAPTIVE_GOVERNOR"] or atr <= 0:
-            return "STANDARD"
-
+        if not CONFIG["ENABLE_ADAPTIVE_GOVERNOR"] or atr <= 0: return "STANDARD"
         vol_ratio = atr / current_price
-        
         if regime == "TREND":
-            if vol_ratio > CONFIG["VOLATILITY_HIGH_THRESHOLD"]:
-                return "TREND_HV"
-            elif vol_ratio < CONFIG["VOLATILITY_LOW_THRESHOLD"]:
-                return "TREND_LV"
-            else:
-                return "STANDARD"
-        elif regime == "RANGE":
-            return "RANGE_SCALP"
-        
+            if vol_ratio > CONFIG["VOLATILITY_HIGH_THRESHOLD"]: return "TREND_HV"
+            elif vol_ratio < CONFIG["VOLATILITY_LOW_THRESHOLD"]: return "TREND_LV"
+            else: return "STANDARD"
+        elif regime == "RANGE": return "RANGE_SCALP"
         return "STANDARD"
 
-# --- PERSISTANCE (V8.5.1) ---
+# --- PERSISTANCE (V8.5.3) ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
         self._init_db()
-        self._migrate_v8_5_1()
+        self._migrate_v8_5_3()
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -219,20 +210,8 @@ class TitanDatabase:
             conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('halt_reason', '')")
             conn.commit()
 
-    def _migrate_v8_5_1(self):
-        with sqlite3.connect(self.db_path) as conn:
-            # v8.5.1: Ajout adaptive_code
-            try: conn.execute("ALTER TABLE trades ADD COLUMN adaptive_code TEXT")
-            except: pass
-            # Robustesse colonnes précédentes
-            try: conn.execute("ALTER TABLE trades ADD COLUMN adaptive_reason TEXT")
-            except: pass
-            try: conn.execute("ALTER TABLE trades ADD COLUMN sl_updates_count INTEGER DEFAULT 0")
-            except: pass
-            try: conn.execute("ALTER TABLE trades ADD COLUMN highest_price REAL") 
-            except: pass
-            try: conn.execute("ALTER TABLE trades ADD COLUMN is_be_active INTEGER DEFAULT 0") 
-            except: pass
+    def _migrate_v8_5_3(self):
+        pass # No schema change
 
     def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id, order_id=None, atr=0.0, regime="UNKNOWN"):
         with sqlite3.connect(self.db_path) as conn:
@@ -246,12 +225,9 @@ class TitanDatabase:
         with sqlite3.connect(self.db_path) as conn:
             sql = "UPDATE trades SET highest_price=?, sl_price=?, is_be_active=?, sl_updates_count=?"
             params = [highest_price, new_sl, 1 if be_active else 0, update_count]
-            
-            # Mise à jour conditionnelle des champs adaptatifs (Freeze logic)
             if adaptive_code:
                 sql += ", adaptive_code=?, adaptive_reason=?"
                 params.extend([adaptive_code, adaptive_reason])
-                
             sql += " WHERE id=?"
             params.append(trade_id)
             conn.execute(sql, tuple(params))
@@ -390,7 +366,6 @@ class TitanEngine:
             start_eq = self.db.get_or_create_daily_stats(eq)
             pnl_pct = ((eq - start_eq) / start_eq * 100) if start_eq > 0 else 0.0
             
-            # Governor Check
             if pnl_pct <= CONFIG["MAX_DAILY_DRAWDOWN_PCT"]:
                 is_halted, _ = self.db.get_halt_state()
                 if not is_halted:
@@ -402,7 +377,6 @@ class TitanEngine:
             clock = self.alpaca.get_clock()
             is_open = clock.is_open
             
-            # Reporting
             if self.was_market_open and not is_open:
                 await self.notifier.send("🏁 Market Closed", f"End of day summary.\n**Equity:** ${round(eq, 2)}\n**Daily PnL:** {round(pnl_pct, 2)}%", priority="INFO")
             self.was_market_open = is_open
@@ -416,7 +390,6 @@ class TitanEngine:
                 "omni": stats
             })
 
-            # Heartbeat
             if datetime.now() - self.last_heartbeat > timedelta(minutes=CONFIG["HEARTBEAT_INTERVAL_MIN"]):
                 spy_vol = 0.0 
                 await self.notifier.send_heartbeat(self.status["state"], round(eq, 2), round(pnl_pct, 2), "N/A")
@@ -426,7 +399,6 @@ class TitanEngine:
 
     async def manage_trade_lifecycle(self, t, current_price, regime_cfg):
         if t['status'] != 'OPEN': return
-        
         current_updates = t['sl_updates_count'] or 0
         if current_updates >= CONFIG["MAX_SL_UPDATES_PER_TRADE"]: return
 
@@ -434,36 +406,25 @@ class TitanEngine:
         atr = t['atr_at_entry']
         if atr <= 0: return
         
-        # --- LOGIQUE DE FREEZE ADAPTATIF (v8.5.1) ---
-        # 1. Vérifier si on doit utiliser l'Adaptatif
+        # Adaptive Logic
         use_adaptive = CONFIG["ENABLE_ADAPTIVE_GOVERNOR"]
-        if t['mode'] == 'SHADOW' and not CONFIG["ENABLE_ADAPTIVE_SHADOW"]:
-            use_adaptive = False
-
-        # 2. Récupérer ou Créer le Profil (Code)
+        if t['mode'] == 'SHADOW' and not CONFIG["ENABLE_ADAPTIVE_SHADOW"]: use_adaptive = False
+        
         profile_code = "STANDARD"
         save_profile = False
-        
         if use_adaptive:
-            # Si déjà défini (et pas INIT), on garde le code figé
-            if t['adaptive_code'] and t['adaptive_code'] != 'INIT':
-                profile_code = t['adaptive_code']
+            if t['adaptive_code'] and t['adaptive_code'] != 'INIT': profile_code = t['adaptive_code']
             else:
-                # Sinon on calcule le nouveau code et on le marquera pour sauvegarde
                 regime = t['market_regime'] if 'market_regime' in t.keys() else "TREND"
                 profile_code = AdaptiveManager.compute_new_profile_code(current_price, atr, regime)
                 save_profile = True
-        else:
-            profile_code = "STANDARD" # Force standard si adaptatif désactivé
+        else: profile_code = "STANDARD"
 
-        # 3. Charger les paramètres depuis le Code
         profile = AdaptiveManager.get_profile(profile_code)
-        
         be_trigger = profile["be_trigger"]
         trailing_step = profile["trailing_step"]
         trailing_offset_mult = profile["trailing_mult_offset"]
         adaptive_desc = profile["desc"]
-        # --------------------------------------------
         
         entry = t['entry_price']
         current_sl = t['sl_price']
@@ -471,24 +432,17 @@ class TitanEngine:
         update_needed = False
         is_be = bool(t['is_be_active'])
 
-        # Logique BE
         if not is_be and (current_price >= entry + (atr * be_trigger)):
             new_sl = entry 
             is_be = True
             update_needed = True
             await self.notifier.send(f"🛡️ Break-Even: {t['symbol']}", f"Profile: {profile_code}. SL -> Entry.", priority="TRADE")
 
-        # Logique Trailing (Améliorée v8.5.1 : Amplitude + Fréquence)
         if regime_cfg["TRAILING"] and is_be:
-            # Base Multiplier du régime + Offset adaptatif
             final_sl_mult = regime_cfg["SL_MULT"] + trailing_offset_mult
-            # Protection absurdité
             if final_sl_mult < 0.5: final_sl_mult = 0.5 
-
             trail_dist = atr * final_sl_mult
             potential_sl = highest - trail_dist
-            
-            # Step check
             if potential_sl > (new_sl + (atr * trailing_step)):
                 new_sl = round(potential_sl, 2)
                 update_needed = True
@@ -501,7 +455,6 @@ class TitanEngine:
                     sl_order = next((o for o in orders if o.type == 'stop' and o.parent_id == t['alpaca_order_id']), None)
                     if not sl_order:
                         sl_order = next((o for o in orders if o.type == 'stop'), None)
-
                     if sl_order:
                         self.alpaca.replace_order(sl_order.id, stop_price=new_sl)
                         success = True
@@ -510,14 +463,11 @@ class TitanEngine:
                         logger.error(f"❌ CRITICAL: SL Order NOT FOUND for {t['symbol']}")
                 except Exception as e:
                     logger.error(f"❌ API ERROR updating {t['symbol']}: {e}")
-            else:
-                success = True
+            else: success = True
 
             if success:
-                # Si on a calculé un nouveau profil au début, on le sauvegarde maintenant pour le figer
                 code_to_save = profile_code if save_profile else None
                 reason_to_save = adaptive_desc if save_profile else None
-                
                 self.db.update_trade_state(t['id'], highest, new_sl, is_be, current_updates + 1, code_to_save, reason_to_save)
 
     async def reconcile_trades(self):
@@ -529,7 +479,6 @@ class TitanEngine:
         for t in trades:
             symbol = t['symbol']
             
-            # PHASE 1: Fermeture
             if t['mode'] == 'LIVE' and symbol not in live_positions:
                 activities = self.alpaca.get_activities(activity_types='FILL')
                 symbol_fills = [f for f in activities if f.symbol == symbol]
@@ -546,12 +495,10 @@ class TitanEngine:
                     exit_price = float(symbol_fills[0].price)
                     res = "TP" if exit_price >= t['entry_price'] else "SL"
                     move_pct = round((exit_price - t['entry_price']) / t['entry_price'] * 100, 2)
-                    
                     self.db.close_trade(t['id'], exit_price, res)
                     await self.notifier.send_trade_exit(symbol, res, t['entry_price'], exit_price, move_pct)
                 continue
 
-            # PHASE 2: Gestion (Active & Frozen Adaptive)
             try:
                 bars = self.alpaca.get_bars(symbol, TimeFrame.Minute, limit=1)
                 if not bars: continue
@@ -569,7 +516,6 @@ class TitanEngine:
                     regime = t['market_regime'] if 'market_regime' in t.keys() else "RANGE"
                     cfg = CONFIG["REGIME_CONFIG"].get(regime, CONFIG["REGIME_CONFIG"]["RANGE"])
                     await self.manage_trade_lifecycle(t, current_price, cfg)
-
             except Exception as e:
                 logger.error(f"Recon error on {symbol}: {e}")
 
@@ -595,7 +541,6 @@ class TitanEngine:
 
     async def run_logic(self):
         await self.reconcile_trades()
-        
         spy_vol = 0.0
         try:
             spy = self.alpaca.get_bars("SPY", TimeFrame.Minute, limit=20)
@@ -649,6 +594,12 @@ class TitanEngine:
                 tp = round(entry + tp_dist, 2)
                 sl = round(entry - sl_dist, 2)
                 
+                # --- v8.5.3 BROKER HYGIENE (Min SL) ---
+                if sl_dist < CONFIG["MIN_SL_DISTANCE_USD"]:
+                    self.db.log_decision(symbol, conf, thesis, "SKIP", "SL_TOO_TIGHT", ai_raw=raw_text)
+                    continue
+                # -------------------------------------
+                
                 if sl_dist < (entry * 0.001): continue
                 qty = math.floor(CONFIG["DOLLAR_RISK_PER_TRADE"] / sl_dist)
                 if qty < 1: continue
@@ -661,11 +612,27 @@ class TitanEngine:
 
                 if can_live:
                     dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", log_msg, ai_raw=raw_text)
-                    order = self.alpaca.submit_order(
-                        symbol=symbol, qty=qty, side='buy', type='market', time_in_force='gtc', 
-                        order_class='bracket', 
-                        take_profit={'limit_price': tp}, stop_loss={'stop_price': sl}
-                    )
+                    
+                    # --- v8.5.3 BROKER HYGIENE (Explicit Error Handling) ---
+                    try:
+                        order = self.alpaca.submit_order(
+                            symbol=symbol, qty=qty, side='buy', type='market', time_in_force='gtc', 
+                            order_class='bracket', 
+                            take_profit={'limit_price': tp}, stop_loss={'stop_price': sl}
+                        )
+                    except APIError as e:
+                        # Rejet technique immédiat (ex: "stop price too close")
+                        self.db.log_decision(symbol, conf, thesis, "LIVE_API_ERROR", str(e), ai_raw=raw_text)
+                        await self.notifier.send_rejection(symbol, "API_ERROR", str(e))
+                        continue
+
+                    if order.status not in ['new', 'accepted', 'pending_new', 'accepted_for_bidding', 'filled', 'partially_filled']:
+                         error_msg = f"Broker Rejected: {order.status}"
+                         self.db.log_decision(symbol, conf, thesis, "LIVE_REJECTED", error_msg, ai_raw=raw_text)
+                         await self.notifier.send_rejection(symbol, order.status, "Immediate Rejection Post-Submit")
+                         continue
+                    # -----------------------------------------------------
+
                     self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id, order.id, atr, regime)
                     logger.info(f"LIVE [{regime}]: {symbol} Qty:{qty} TP:{tp} SL:{sl}")
                     await self.notifier.send_trade_entry(symbol, "BUY", qty, entry, thesis, regime)
@@ -727,7 +694,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Frozen v8.5.1 Ready. Adaptive Profiles Locked.")
+    logger.info(f"Titan-Hygiene v8.5.3 Ready. Broker Safe.")
     await titan.main_loop()
 
 if __name__ == "__main__":
