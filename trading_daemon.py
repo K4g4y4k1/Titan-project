@@ -303,8 +303,8 @@ class TitanDatabase:
 # --- MOTEUR TITAN ---
 class TitanEngine:
     def __init__(self):
-        self.alpaca_key = os.getenv('ALPACA_KEY')
-        self.alpaca_secret = os.getenv('ALPACA_SECRET')
+        self.alpaca_key = os.getenv('ALPACA_API_KEY')
+        self.alpaca_secret = os.getenv('ALPACA_SECRET_KEY')
         base_url = "https://paper-api.alpaca.markets" if CONFIG["ENV_MODE"] == 'PAPER' else "https://api.alpaca.markets"
         self.alpaca = tradeapi.REST(self.alpaca_key, self.alpaca_secret, base_url)
         self.db = TitanDatabase(CONFIG["DB_PATH"])
