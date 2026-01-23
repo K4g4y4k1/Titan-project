@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.5.6 ---
+# --- CONFIGURATION V8.5.7 ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,7 +22,7 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 
 CONFIG = {
-    "VERSION": "8.5.6-Wallet-Aware",
+    "VERSION": "8.5.7-RealTime-Wallet",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     "MAX_OPEN_POSITIONS": 3,
@@ -56,9 +56,9 @@ CONFIG = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_5_6.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_5_7.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-WalletAware")
+logger = logging.getLogger("Titan-RTWallet")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -169,12 +169,12 @@ class AdaptiveManager:
         elif regime == "RANGE": return "RANGE_SCALP"
         return "STANDARD"
 
-# --- PERSISTANCE (V8.5.6) ---
+# --- PERSISTANCE (V8.5.7) ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
         self._init_db()
-        self._migrate_v8_5_6()
+        self._migrate_v8_5_7()
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -208,7 +208,7 @@ class TitanDatabase:
             conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('halt_reason', '')")
             conn.commit()
 
-    def _migrate_v8_5_6(self):
+    def _migrate_v8_5_7(self):
         pass 
 
     def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id, order_id=None, atr=0.0, regime="UNKNOWN"):
@@ -386,7 +386,6 @@ class TitanEngine:
             stats = self.db.get_stats()
             self.status.update({
                 "market": "OPEN" if is_open else "CLOSED",
-                # V8.5.6: MAJ Buying Power
                 "equity": {"current": round(eq, 2), "pnl_pct": round(pnl_pct, 2), "buying_power": round(bp, 2)},
                 "positions": {
                     "live_broker": len(self.alpaca.list_positions()), 
@@ -607,26 +606,20 @@ class TitanEngine:
                 
                 if sl_dist < (entry * 0.001): continue
                 
-                # --- V8.5.6 FIX: Buying Power Cap ---
-                # 1. Calcul du risque théorique
+                # --- V8.5.7 PATCH: Real-Time Wallet Tracking ---
                 raw_qty = math.floor(CONFIG["DOLLAR_RISK_PER_TRADE"] / sl_dist)
                 
-                # 2. Vérification du Buying Power (Max 95% du buying power réel pour laisser une marge)
-                # Note: On utilise self.status qui est mis à jour par sync_data. 
-                # C'est une approximation acceptable car sync_data tourne toutes les 60s.
                 current_bp = self.status["equity"]["buying_power"]
-                if current_bp <= 0: current_bp = self.status["equity"]["current"] # Fallback si BP non dispo
+                if current_bp <= 0: current_bp = self.status["equity"]["current"]
                 
-                max_affordable_qty = math.floor((current_bp * 0.95) / entry) # 5% buffer pour fees/slippage
+                max_affordable_qty = math.floor((current_bp * 0.95) / entry)
                 
-                # 3. La quantité finale est le minimum des deux
                 qty = min(raw_qty, max_affordable_qty)
                 
                 capped_reason = ""
                 if qty < raw_qty:
                     capped_reason = f"(Wallet Capped: Risk ${round(qty*sl_dist, 2)})"
-                # ------------------------------------
-
+                
                 if qty < 1: 
                     self.db.log_decision(symbol, conf, thesis, "SKIP", "INSUFFICIENT_FUNDS", ai_raw=raw_text)
                     continue
@@ -656,6 +649,12 @@ class TitanEngine:
                          self.db.log_decision(symbol, conf, thesis, "LIVE_REJECTED", error_msg, ai_raw=raw_text)
                          await self.notifier.send_rejection(symbol, order.status, "Immediate Rejection Post-Submit")
                          continue
+                    
+                    # --- V8.5.7: Débit immédiat du Buying Power Local ---
+                    estimated_cost = qty * entry
+                    self.status["equity"]["buying_power"] -= estimated_cost
+                    self.status["positions"]["live_titan"] += 1
+                    # ----------------------------------------------------
 
                     self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id, order.id, atr, regime)
                     logger.info(f"LIVE [{regime}]: {symbol} Qty:{qty} TP:{tp} SL:{sl} {capped_reason}")
@@ -718,7 +717,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-WalletAware v8.5.6 Ready. Funds Protection Active.")
+    logger.info(f"Titan-RTWallet v8.5.7 Ready. Funds Protection + Loop Safety.")
     await titan.main_loop()
 
 if __name__ == "__main__":
