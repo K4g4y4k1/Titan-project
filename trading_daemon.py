@@ -49,7 +49,7 @@ CONFIG = {
     "NOTIFY_LEVEL": "INFO",
     "MIN_SL_DISTANCE_USD": 0.05,
     "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
-    "AI_MODEL": "deepseek/deepseek-v3.2",
+    "AI_MODEL": "openai/gpt-5.2-chat",
     "SCAN_INTERVAL": 60 
 }
 
