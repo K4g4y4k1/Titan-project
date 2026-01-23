@@ -322,7 +322,8 @@ class TitanEngine:
             "equity": {"current": 0.0, "pnl_pct": 0.0, "buying_power": 0.0},
             "safety": {"consecutive_sl": 0, "market_stress": False},
             "positions": {"live_broker": 0, "live_titan": 0, "shadow_open": 0},
-            "omni": {"decisions_today": 0, "shadow_winrate": 0, "last_action": "N/A"}
+            "omni": {"decisions_today": 0, "shadow_winrate": 0, "last_action": "N/A"},
+            "model": CONFIG["AI_MODEL"]
         }
 
     async def get_session(self):
