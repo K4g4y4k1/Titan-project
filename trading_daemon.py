@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.5.7 ---
+# --- CONFIGURATION V8.5.8 ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,7 +22,7 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 
 CONFIG = {
-    "VERSION": "8.5.7-RealTime-Wallet",
+    "VERSION": "8.5.8-Broker-Safe",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     "MAX_OPEN_POSITIONS": 3,
@@ -56,9 +56,9 @@ CONFIG = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_5_7.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_5_8.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-RTWallet")
+logger = logging.getLogger("Titan-BrokerSafe")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -169,12 +169,12 @@ class AdaptiveManager:
         elif regime == "RANGE": return "RANGE_SCALP"
         return "STANDARD"
 
-# --- PERSISTANCE (V8.5.7) ---
+# --- PERSISTANCE (V8.5.8) ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
         self._init_db()
-        self._migrate_v8_5_7()
+        self._migrate_v8_5_8()
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -208,7 +208,7 @@ class TitanDatabase:
             conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('halt_reason', '')")
             conn.commit()
 
-    def _migrate_v8_5_7(self):
+    def _migrate_v8_5_8(self):
         pass 
 
     def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id, order_id=None, atr=0.0, regime="UNKNOWN"):
@@ -393,7 +393,8 @@ class TitanEngine:
                     "shadow_open": stats['shadow_open_count']
                 },
                 "safety": {"consecutive_sl": stats['consecutive_sl']},
-                "omni": stats
+                "omni": stats,
+                "model": CONFIG["AI_MODEL"]
             })
 
             if datetime.now() - self.last_heartbeat > timedelta(minutes=CONFIG["HEARTBEAT_INTERVAL_MIN"]):
@@ -599,6 +600,21 @@ class TitanEngine:
                 tp_dist = atr * tp_mult
                 tp = round(entry + tp_dist, 2)
                 sl = round(entry - sl_dist, 2)
+
+                # --- V8.5.8 PATCH: BROKER HARD CLAMP ---
+                clamped_msg = ""
+                # Force min 1 cent distance (Tick size safety)
+                if tp <= entry:
+                    tp = round(entry + 0.01, 2)
+                    clamped_msg += "[TP Clamped]"
+                
+                if sl >= entry:
+                    sl = round(entry - 0.01, 2)
+                    clamped_msg += "[SL Clamped]"
+                
+                # Recalculate distance based on Clamped SL to protect risk
+                sl_dist = round(entry - sl, 2)
+                # --------------------------------------
                 
                 if sl_dist < CONFIG["MIN_SL_DISTANCE_USD"]:
                     self.db.log_decision(symbol, conf, thesis, "SKIP", "SL_TOO_TIGHT", ai_raw=raw_text)
@@ -628,7 +644,7 @@ class TitanEngine:
                            self.status["positions"]["live_titan"] < CONFIG["MAX_OPEN_POSITIONS"] and 
                            not self.status["safety"]["market_stress"])
                 
-                log_msg = f"Regime:{regime} ATR:{round(atr,2)} {capped_reason}"
+                log_msg = f"Regime:{regime} ATR:{round(atr,2)} {capped_reason} {clamped_msg}"
 
                 if can_live:
                     dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", log_msg, ai_raw=raw_text)
@@ -657,7 +673,7 @@ class TitanEngine:
                     # ----------------------------------------------------
 
                     self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id, order.id, atr, regime)
-                    logger.info(f"LIVE [{regime}]: {symbol} Qty:{qty} TP:{tp} SL:{sl} {capped_reason}")
+                    logger.info(f"LIVE [{regime}]: {symbol} Qty:{qty} TP:{tp} SL:{sl} {capped_reason} {clamped_msg}")
                     await self.notifier.send_trade_entry(symbol, "BUY", qty, entry, thesis, regime)
                 else:
                     rej = "STRESS" if self.status["safety"]["market_stress"] else "CONF/LIMIT"
@@ -717,7 +733,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-RTWallet v8.5.7 Ready. Funds Protection + Loop Safety.")
+    logger.info(f"Titan-BrokerSafe v8.5.8 Ready. Hard Clamps Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
