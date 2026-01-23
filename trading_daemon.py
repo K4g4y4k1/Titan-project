@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.6.1 (RETAIL FORTRESS) ---
+# --- CONFIGURATION V8.6.5 (RETAIL GRIND) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,23 +22,38 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 
 CONFIG = {
-    "VERSION": "8.6.1-Retail-Fortress",
+    "VERSION": "8.6.5-Titan-Retail-Grind",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
-    "MAX_OPEN_POSITIONS": 4, 
-    "RISK_PCT_PER_TRADE": 2.0,       # Risque unitaire (2%)
-    "MAX_TOTAL_RISK_PCT": 5.0,       # Risque global cumulé MAX (5%) - Sécurité V8.6.1
+    "MAX_OPEN_POSITIONS": 5,           
+    "MAX_MACRO_POSITIONS": 1,          
+    "RISK_PCT_PER_TRADE": 2.0,       
+    "MAX_TOTAL_RISK_PCT": 6.0,         
     "LIVE_THRESHOLD": 76,
+    "MACRO_THRESHOLD": 85,             
     "MIN_TRADE_AMOUNT_USD": 150.0,
     "MARKET_STRESS_THRESHOLD": 1.8,
     "COOLDOWN_PER_SYMBOL_MIN": 15,
+    "SHADOW_PROMOTION_WINDOW_HOURS": 24, 
     "ATR_PERIOD": 14,
+    "ALLOW_SHORTS": True,
+    
+    # --- V8.6.5: RECALIBRATION REGIMES ---
     "REGIME_CONFIG": {
-        "TREND": {"TP_MULT": 3.0, "SL_MULT": 1.5, "DESC": "Trend following", "TRAILING": True},
-        "RANGE": {"TP_MULT": 1.5, "SL_MULT": 1.0, "DESC": "Mean reversion", "TRAILING": False},
-        "CHOP":  {"TP_MULT": 0.0, "SL_MULT": 0.0, "DESC": "No trade zone", "TRAILING": False} 
+        # TREND: On garde un RR positif car on joue le momentum
+        "TREND": {"TP_MULT": 2.5, "SL_MULT": 1.2, "DESC": "Trend Following", "TRAILING": True},
+        
+        # RANGE (RETAIL SCALP): Le coeur du changement v8.6.5
+        # TP court (0.7) pour encaisser vite. SL large (1.3) pour respirer.
+        "RANGE": {"TP_MULT": 0.7, "SL_MULT": 1.3, "DESC": "Retail Scalp (Cashflow)", "TRAILING": False},
+        
+        "CHOP":  {"TP_MULT": 0.0, "SL_MULT": 0.0, "DESC": "No trade zone", "TRAILING": False},
+        
+        # MACRO: Le Sniper (inchangé)
+        "MACRO": {"TP_MULT": 6.0, "SL_MULT": 4.0, "DESC": "Macro Structural", "TRAILING": False} 
     },
-    "BE_TRIGGER_ATR": 1.0,
+    
+    "BE_TRIGGER_ATR": 0.4, # V8.6.5: BE beaucoup plus rapide (0.4 vs 1.0)
     "TRAILING_STEP_ATR": 0.5,
     "ENABLE_ADAPTIVE_GOVERNOR": True,
     "ENABLE_ADAPTIVE_SHADOW": False,
@@ -51,16 +66,16 @@ CONFIG = {
     "NOTIFY_LEVEL": "INFO",
     "MIN_SL_DISTANCE_USD": 0.05,
     "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
-    "AI_MODEL": "openai/gpt-5.2-chat",
+    "AI_MODEL": "deepseek/deepseek-v3.2",
     "SCAN_INTERVAL": 60 
 }
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_6_1.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_6_5.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-RetailFortress")
+logger = logging.getLogger("Titan-RetailGrind")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -109,8 +124,9 @@ class NotificationManager:
         except Exception as e: logger.error(f"Notification error: {e}")
 
     async def send_trade_entry(self, symbol, side, qty, price, thesis, regime):
+        emoji = "📈" if side == "BUY" else "📉"
         msg = f"**Symbol:** {symbol}\n**Side:** {side}\n**Qty:** {qty}\n**Price:** ${price}\n**Regime:** {regime}\n**Thesis:** {thesis}"
-        await self.send(f"🚀 Trade Entry: {symbol}", msg, priority="TRADE")
+        await self.send(f"{emoji} Trade Entry: {symbol}", msg, priority="TRADE")
 
     async def send_trade_exit(self, symbol, result, entry, exit_price, pnl_pct):
         emoji = "💰" if result == "TP" else "🛑"
@@ -127,39 +143,20 @@ class NotificationManager:
     async def send_rejection(self, symbol, status, reason):
         await self.send(f"⚠️ Order Rejected: {symbol}", f"**Status:** {status}\n**Reason:** {reason}", priority="ERROR")
 
-# --- ADAPTIVE MANAGER (Frozen) ---
+# --- ADAPTIVE MANAGER ---
 class AdaptiveManager:
     PROFILES = {
-        "STANDARD": {
-            "be_trigger": CONFIG["BE_TRIGGER_ATR"],
-            "trailing_step": CONFIG["TRAILING_STEP_ATR"],
-            "trailing_mult_offset": 0.0,
-            "desc": "Standard v8.4"
-        },
-        "TREND_HV": { 
-            "be_trigger": 1.5,
-            "trailing_step": 0.8,
-            "trailing_mult_offset": 0.5,
-            "desc": "Trend High Vol (Loose)"
-        },
-        "TREND_LV": { 
-            "be_trigger": 0.8,
-            "trailing_step": 0.3,
-            "trailing_mult_offset": -0.2,
-            "desc": "Trend Low Vol (Tight)"
-        },
-        "RANGE_SCALP": {
-            "be_trigger": 0.8,
-            "trailing_step": 0.0,
-            "trailing_mult_offset": 0.0,
-            "desc": "Range Scalp"
-        }
+        "STANDARD": {"be_trigger": 1.0, "trailing_step": CONFIG["TRAILING_STEP_ATR"], "trailing_mult_offset": 0.0, "desc": "Standard"},
+        "TREND_HV": {"be_trigger": 1.5, "trailing_step": 0.8, "trailing_mult_offset": 0.5, "desc": "Trend High Vol"},
+        "TREND_LV": {"be_trigger": 0.8, "trailing_step": 0.3, "trailing_mult_offset": -0.2, "desc": "Trend Low Vol"},
+        
+        # V8.6.5: RETAIL SCALP Profile (Aggressive BE)
+        "RANGE_SCALP": {"be_trigger": 0.4, "trailing_step": 0.0, "trailing_mult_offset": 0.0, "desc": "Retail Scalp"},
+        
+        "MACRO": {"be_trigger": 2.5, "trailing_step": 1.0, "trailing_mult_offset": 1.0, "desc": "Macro Structural"} 
     }
-
     @staticmethod
-    def get_profile(code):
-        return AdaptiveManager.PROFILES.get(code, AdaptiveManager.PROFILES["STANDARD"])
-
+    def get_profile(code): return AdaptiveManager.PROFILES.get(code, AdaptiveManager.PROFILES["STANDARD"])
     @staticmethod
     def compute_new_profile_code(current_price, atr, regime):
         if not CONFIG["ENABLE_ADAPTIVE_GOVERNOR"] or atr <= 0: return "STANDARD"
@@ -171,12 +168,12 @@ class AdaptiveManager:
         elif regime == "RANGE": return "RANGE_SCALP"
         return "STANDARD"
 
-# --- PERSISTANCE (V8.6.1) ---
+# --- PERSISTANCE (V8.6.5) ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
         self._init_db()
-        self._migrate_v8_6_1()
+        self._migrate_v8_6_5()
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -192,7 +189,8 @@ class TitanDatabase:
                     highest_price REAL, is_be_active INTEGER DEFAULT 0,
                     sl_updates_count INTEGER DEFAULT 0,
                     adaptive_code TEXT,
-                    adaptive_reason TEXT
+                    adaptive_reason TEXT,
+                    side TEXT DEFAULT 'BUY'
                 )
             """)
             conn.execute("""
@@ -210,15 +208,18 @@ class TitanDatabase:
             conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('halt_reason', '')")
             conn.commit()
 
-    def _migrate_v8_6_1(self):
-        pass 
+    def _migrate_v8_6_5(self):
+        with sqlite3.connect(self.db_path) as conn:
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN side TEXT DEFAULT 'BUY'")
+            except sqlite3.OperationalError: pass 
 
-    def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id, order_id=None, atr=0.0, regime="UNKNOWN"):
+    def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id, order_id, atr, regime, side, adaptive_code="INIT"):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""INSERT INTO trades 
-                (symbol, qty, entry_price, confidence, thesis, mode, tp_price, sl_price, status, decision_id, alpaca_order_id, atr_at_entry, market_regime, highest_price, sl_updates_count, adaptive_code, adaptive_reason) 
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'INIT','Initialized')""",
-                (symbol, qty, price, conf, thesis, mode, tp, sl, 'OPEN', dec_id, order_id, atr, regime, price))
+                (symbol, qty, entry_price, confidence, thesis, mode, tp_price, sl_price, status, decision_id, alpaca_order_id, atr_at_entry, market_regime, highest_price, sl_updates_count, adaptive_code, adaptive_reason, side) 
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,'Initialized',?)""",
+                (symbol, qty, price, conf, thesis, mode, tp, sl, 'OPEN', dec_id, order_id, atr, regime, price, adaptive_code, side))
             conn.commit()
 
     def update_trade_state(self, trade_id, highest_price, new_sl, be_active, update_count, adaptive_code=None, adaptive_reason=None):
@@ -255,6 +256,15 @@ class TitanDatabase:
                 WHERE symbol=? AND result='SL' AND date(exit_time) = date('now')
             """, (symbol,)).fetchone()[0]
             return count
+
+    def has_recent_shadow_win(self, symbol):
+        with sqlite3.connect(self.db_path) as conn:
+            threshold = datetime.now() - timedelta(hours=CONFIG["SHADOW_PROMOTION_WINDOW_HOURS"])
+            count = conn.execute("""
+                SELECT COUNT(*) FROM trades 
+                WHERE symbol=? AND mode='SHADOW' AND result='TP' AND exit_time > ?
+            """, (symbol, threshold)).fetchone()[0]
+            return count > 0
 
     def get_stats(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -411,10 +421,11 @@ class TitanEngine:
         current_updates = t['sl_updates_count'] or 0
         if current_updates >= CONFIG["MAX_SL_UPDATES_PER_TRADE"]: return
 
-        highest = max(t['highest_price'] or t['entry_price'], current_price)
+        trade_side = t['side'] # BUY or SELL
+        
         atr = t['atr_at_entry']
         if atr <= 0: return
-        
+
         # Adaptive Logic
         use_adaptive = CONFIG["ENABLE_ADAPTIVE_GOVERNOR"]
         if t['mode'] == 'SHADOW' and not CONFIG["ENABLE_ADAPTIVE_SHADOW"]: use_adaptive = False
@@ -422,13 +433,16 @@ class TitanEngine:
         profile_code = "STANDARD"
         save_profile = False
         if use_adaptive:
-            if t['adaptive_code'] and t['adaptive_code'] != 'INIT': profile_code = t['adaptive_code']
+            if t['adaptive_code'] and t['adaptive_code'] != 'INIT': 
+                profile_code = t['adaptive_code']
             else:
-                regime = t['market_regime'] if 'market_regime' in t.keys() else "TREND"
-                profile_code = AdaptiveManager.compute_new_profile_code(current_price, atr, regime)
-                save_profile = True
-        else: profile_code = "STANDARD"
-
+                if t['adaptive_code'] == 'MACRO':
+                    profile_code = 'MACRO'
+                else:
+                    regime = t['market_regime'] if 'market_regime' in t.keys() else "TREND"
+                    profile_code = AdaptiveManager.compute_new_profile_code(current_price, atr, regime)
+                    save_profile = True
+        
         profile = AdaptiveManager.get_profile(profile_code)
         be_trigger = profile["be_trigger"]
         trailing_step = profile["trailing_step"]
@@ -441,22 +455,50 @@ class TitanEngine:
         update_needed = False
         is_be = bool(t['is_be_active'])
 
-        if not is_be and (current_price >= entry + (atr * be_trigger)):
-            new_sl = entry 
-            is_be = True
-            update_needed = True
-            await self.notifier.send(f"🛡️ Break-Even: {t['symbol']}", f"Profile: {profile_code}. SL -> Entry.", priority="TRADE")
-
-        if regime_cfg["TRAILING"] and is_be:
-            final_sl_mult = regime_cfg["SL_MULT"] + trailing_offset_mult
-            if final_sl_mult < 0.5: final_sl_mult = 0.5 
-            trail_dist = atr * final_sl_mult
-            potential_sl = highest - trail_dist
-            if potential_sl > (new_sl + (atr * trailing_step)):
-                new_sl = round(potential_sl, 2)
+        # --- LOGIC FOR BUY (LONG) ---
+        if trade_side == "BUY":
+            highest = max(t['highest_price'] or entry, current_price)
+            
+            if not is_be and (current_price >= entry + (atr * be_trigger)):
+                new_sl = entry 
+                is_be = True
                 update_needed = True
+                await self.notifier.send(f"🛡️ Break-Even (LONG): {t['symbol']}", f"Profile: {profile_code}. SL -> Entry.", priority="TRADE")
+            
+            if regime_cfg["TRAILING"] and is_be:
+                final_sl_mult = regime_cfg["SL_MULT"] + trailing_offset_mult
+                if final_sl_mult < 0.5: final_sl_mult = 0.5
+                trail_dist = atr * final_sl_mult
+                potential_sl = highest - trail_dist
+                if potential_sl > (new_sl + (atr * trailing_step)):
+                    new_sl = round(potential_sl, 2)
+                    update_needed = True
+            
+            if update_needed and new_sl <= current_sl: update_needed = False
 
-        if update_needed and new_sl > current_sl:
+        # --- LOGIC FOR SELL (SHORT) ---
+        elif trade_side == "SELL":
+            lowest = min(t['highest_price'] or entry, current_price)
+            highest = lowest 
+            
+            if not is_be and (current_price <= entry - (atr * be_trigger)):
+                new_sl = entry
+                is_be = True
+                update_needed = True
+                await self.notifier.send(f"🛡️ Break-Even (SHORT): {t['symbol']}", f"Profile: {profile_code}. SL -> Entry.", priority="TRADE")
+
+            if regime_cfg["TRAILING"] and is_be:
+                final_sl_mult = regime_cfg["SL_MULT"] + trailing_offset_mult
+                if final_sl_mult < 0.5: final_sl_mult = 0.5
+                trail_dist = atr * final_sl_mult
+                potential_sl = lowest + trail_dist 
+                if potential_sl < (new_sl - (atr * trailing_step)):
+                    new_sl = round(potential_sl, 2)
+                    update_needed = True
+            
+            if update_needed and new_sl >= current_sl: update_needed = False
+
+        if update_needed:
             success = False
             if t['mode'] == 'LIVE':
                 try:
@@ -467,7 +509,7 @@ class TitanEngine:
                     if sl_order:
                         self.alpaca.replace_order(sl_order.id, stop_price=new_sl)
                         success = True
-                        logger.info(f"✅ ALPACA ORDER UPDATED {t['symbol']} SL -> {new_sl} ({profile_code})")
+                        logger.info(f"✅ ALPACA ORDER UPDATED {t['symbol']} ({trade_side}) SL -> {new_sl} ({profile_code})")
                     else:
                         logger.error(f"❌ CRITICAL: SL Order NOT FOUND for {t['symbol']}")
                 except Exception as e:
@@ -487,6 +529,7 @@ class TitanEngine:
 
         for t in trades:
             symbol = t['symbol']
+            trade_side = t['side']
             
             if t['mode'] == 'LIVE' and symbol not in live_positions:
                 activities = self.alpaca.get_activities(activity_types='FILL')
@@ -502,8 +545,14 @@ class TitanEngine:
 
                 if symbol_fills:
                     exit_price = float(symbol_fills[0].price)
-                    res = "TP" if exit_price >= t['entry_price'] else "SL"
-                    move_pct = round((exit_price - t['entry_price']) / t['entry_price'] * 100, 2)
+                    
+                    if trade_side == "BUY":
+                        res = "TP" if exit_price >= t['entry_price'] else "SL"
+                        move_pct = round((exit_price - t['entry_price']) / t['entry_price'] * 100, 2)
+                    else: # SELL
+                        res = "TP" if exit_price <= t['entry_price'] else "SL"
+                        move_pct = round((t['entry_price'] - exit_price) / t['entry_price'] * 100, 2) 
+
                     self.db.close_trade(t['id'], exit_price, res)
                     await self.notifier.send_trade_exit(symbol, res, t['entry_price'], exit_price, move_pct)
                 continue
@@ -514,16 +563,33 @@ class TitanEngine:
                 current_price = bars[0].c
 
                 if t['mode'] == 'SHADOW':
-                    if current_price >= t['tp_price']: self.db.close_trade(t['id'], current_price, "TP")
-                    elif current_price <= t['sl_price']: self.db.close_trade(t['id'], current_price, "SL")
-                    else:
+                    is_closed = False
+                    if trade_side == "BUY":
+                        if current_price >= t['tp_price']: 
+                            self.db.close_trade(t['id'], current_price, "TP")
+                            is_closed = True
+                        elif current_price <= t['sl_price']: 
+                            self.db.close_trade(t['id'], current_price, "SL")
+                            is_closed = True
+                    else: # SELL
+                        if current_price <= t['tp_price']: 
+                            self.db.close_trade(t['id'], current_price, "TP")
+                            is_closed = True
+                        elif current_price >= t['sl_price']: 
+                            self.db.close_trade(t['id'], current_price, "SL")
+                            is_closed = True
+
+                    if not is_closed:
                         regime = t['market_regime'] if 'market_regime' in t.keys() else "RANGE"
                         cfg = CONFIG["REGIME_CONFIG"].get(regime, CONFIG["REGIME_CONFIG"]["RANGE"])
                         await self.manage_trade_lifecycle(t, current_price, cfg)
 
                 elif t['mode'] == 'LIVE':
                     regime = t['market_regime'] if 'market_regime' in t.keys() else "RANGE"
-                    cfg = CONFIG["REGIME_CONFIG"].get(regime, CONFIG["REGIME_CONFIG"]["RANGE"])
+                    if t['adaptive_code'] == 'MACRO':
+                        cfg = CONFIG["REGIME_CONFIG"]["MACRO"]
+                    else:
+                        cfg = CONFIG["REGIME_CONFIG"].get(regime, CONFIG["REGIME_CONFIG"]["RANGE"])
                     await self.manage_trade_lifecycle(t, current_price, cfg)
             except Exception as e:
                 logger.error(f"Recon error on {symbol}: {e}")
@@ -532,7 +598,7 @@ class TitanEngine:
         s = await self.get_session()
         prompt = (
             "Analyze US market structure. Return ONLY JSON: "
-            "{'picks': [{'symbol': 'TICKER', 'confidence': 95, 'reason': 'short thesis'}]}. "
+            "{'picks': [{'symbol': 'TICKER', 'side': 'BUY' or 'SELL', 'confidence': 95, 'reason': 'thesis'}]}. "
             "Identify high probability setups."
         )
         try:
@@ -565,21 +631,27 @@ class TitanEngine:
             self.db.log_decision("SYSTEM", 0, f"Heartbeat (Vol:{round(spy_vol,2)}%).", "IDLE", ai_raw=raw_text)
             return
 
-        # --- V8.6.1: INIT INTRA-LOOP CASH MEMORY ---
         intra_loop_committed_cash = 0.0
         intra_loop_committed_risk = 0.0
         
-        # Calculate current total risk from open positions
         current_open_trades = self.db.get_open_trades('LIVE')
         current_open_risk = 0.0
+        current_macro_count = 0 
+        
         for t in current_open_trades:
-            # Risk = (Entry - SL) * Qty
-            trade_risk = (t['entry_price'] - t['sl_price']) * t['qty']
+            trade_risk = abs(t['entry_price'] - t['sl_price']) * t['qty']
             if trade_risk > 0: current_open_risk += trade_risk
-        # ------------------------------------------
+            if t['adaptive_code'] == 'MACRO': current_macro_count += 1
 
         for p in picks:
             symbol = p.get('symbol', '').upper()
+            side = p.get('side', 'BUY').upper()
+            if side not in ['BUY', 'SELL']: side = 'BUY'
+            
+            if side == 'SELL' and not CONFIG["ALLOW_SHORTS"]:
+                 self.db.log_decision(symbol, 0, p.get('reason',''), "SKIP", "SHORTS_DISABLED", ai_raw=raw_text)
+                 continue
+
             conf, thesis = p.get('confidence', 0), p.get('reason', 'N/A')
             if not symbol: continue
             
@@ -607,57 +679,66 @@ class TitanEngine:
                     self.db.log_decision(symbol, conf, thesis, "SKIP", "REGIME_CHOP", ai_raw=raw_text)
                     continue
                 
-                regime_settings = CONFIG["REGIME_CONFIG"].get(regime, CONFIG["REGIME_CONFIG"]["RANGE"])
+                is_macro_mode = False
+                is_shadow_promoted = self.db.has_recent_shadow_win(symbol)
+                
+                if conf >= CONFIG["MACRO_THRESHOLD"] or is_shadow_promoted:
+                    is_macro_mode = True
+                    regime_settings = CONFIG["REGIME_CONFIG"]["MACRO"]
+                    mode_tag = "MACRO"
+                else:
+                    regime_settings = CONFIG["REGIME_CONFIG"].get(regime, CONFIG["REGIME_CONFIG"]["RANGE"])
+                    mode_tag = regime
+                
                 tp_mult = regime_settings["TP_MULT"]
                 sl_mult = regime_settings["SL_MULT"]
 
                 sl_dist = atr * sl_mult
                 tp_dist = atr * tp_mult
-                tp = round(entry + tp_dist, 2)
-                sl = round(entry - sl_dist, 2)
 
-                # --- BROKER HARD CLAMP ---
-                clamped_msg = ""
-                if tp <= entry:
-                    tp = round(entry + 0.01, 2)
-                    clamped_msg += "[TP Clamped]"
+                if side == "BUY":
+                    tp = round(entry + tp_dist, 2)
+                    sl = round(entry - sl_dist, 2)
+                    if tp <= entry: tp = round(entry + 0.01, 2)
+                    if sl >= entry: sl = round(entry - 0.01, 2)
+                    sl_dist = round(entry - sl, 2)
+                else: # SELL
+                    tp = round(entry - tp_dist, 2)
+                    sl = round(entry + sl_dist, 2)
+                    if tp >= entry: tp = round(entry - 0.01, 2)
+                    if sl <= entry: sl = round(entry + 0.01, 2)
+                    sl_dist = round(sl - entry, 2)
                 
-                if sl >= entry:
-                    sl = round(entry - 0.01, 2)
-                    clamped_msg += "[SL Clamped]"
-                
-                sl_dist = round(entry - sl, 2)
-                
-                if sl_dist < CONFIG["MIN_SL_DISTANCE_USD"]:
-                    self.db.log_decision(symbol, conf, thesis, "SKIP", "SL_TOO_TIGHT", ai_raw=raw_text)
-                    continue
+                if not is_macro_mode:
+                    if sl_dist < CONFIG["MIN_SL_DISTANCE_USD"]:
+                        self.db.log_decision(symbol, conf, thesis, "SKIP", "SL_TOO_TIGHT", ai_raw=raw_text)
+                        continue
                 
                 if sl_dist < (entry * 0.001): continue
                 
-                # --- RETAIL SIZING ---
                 current_equity = self.status["equity"]["current"]
                 if current_equity <= 0: current_equity = 1000.0
                 
                 risk_amount_usd = current_equity * (CONFIG["RISK_PCT_PER_TRADE"] / 100.0)
                 raw_qty = math.floor(risk_amount_usd / sl_dist)
                 
-                # --- V8.6.1: USE INTRA-LOOP BP ---
                 current_bp_snapshot = self.status["equity"]["buying_power"]
                 if current_bp_snapshot <= 0: current_bp_snapshot = current_equity
                 
                 effective_bp = current_bp_snapshot - intra_loop_committed_cash
-                
                 max_affordable_qty = math.floor((effective_bp * 0.95) / entry)
                 qty = min(raw_qty, max_affordable_qty)
                 
-                # --- V8.6.1: DUST TRADES RECYCLING (Downgrade to Shadow) ---
                 force_shadow = False
                 force_reason = ""
                 
                 if (qty * entry) < CONFIG["MIN_TRADE_AMOUNT_USD"]:
-                    force_shadow = True
-                    force_reason = f"DUST_RETAIL (<${CONFIG['MIN_TRADE_AMOUNT_USD']})"
-                
+                    if not is_macro_mode:
+                        force_shadow = True
+                        force_reason = f"DUST_RETAIL (<${CONFIG['MIN_TRADE_AMOUNT_USD']})"
+                    else:
+                        capped_reason += " [Micro-Pos Allowed]"
+
                 capped_reason = ""
                 if qty < raw_qty:
                     capped_reason = f"[Cash Drag: Risk ${round(qty*sl_dist, 2)}]"
@@ -666,7 +747,6 @@ class TitanEngine:
                     self.db.log_decision(symbol, conf, thesis, "SKIP", "INSUFFICIENT_FUNDS", ai_raw=raw_text)
                     continue
 
-                # --- V8.6.1: TOTAL RISK CAP CHECK ---
                 new_trade_risk = qty * sl_dist
                 potential_total_risk = current_open_risk + intra_loop_committed_risk + new_trade_risk
                 max_allowed_risk = current_equity * (CONFIG["MAX_TOTAL_RISK_PCT"] / 100.0)
@@ -674,21 +754,30 @@ class TitanEngine:
                 if potential_total_risk > max_allowed_risk:
                     force_shadow = True
                     force_reason = f"RISK_CAP_BREACH (Total Risk > {CONFIG['MAX_TOTAL_RISK_PCT']}%)"
-                # --------------------------------------
 
-                can_live = (conf >= CONFIG["LIVE_THRESHOLD"] and 
-                           self.status["positions"]["live_titan"] < CONFIG["MAX_OPEN_POSITIONS"] and 
-                           not self.status["safety"]["market_stress"] and
-                           not force_shadow) # Safety Check added
+                if is_macro_mode and current_macro_count >= CONFIG["MAX_MACRO_POSITIONS"]:
+                    force_shadow = True
+                    force_reason = "MACRO_SLOT_FULL (Sniper Mode)"
+
+                force_live_trigger = (is_shadow_promoted or (conf >= CONFIG["MACRO_THRESHOLD"]))
                 
-                log_msg = f"Regime:{regime} ATR:{round(atr,2)} {capped_reason} {clamped_msg}"
+                can_live = (
+                    (conf >= CONFIG["LIVE_THRESHOLD"] or force_live_trigger) and 
+                    self.status["positions"]["live_titan"] < CONFIG["MAX_OPEN_POSITIONS"] and 
+                    not force_shadow
+                )
+                
+                if self.status["safety"]["market_stress"]: can_live = False
+
+                log_msg = f"Side:{side} Mode:{mode_tag} ATR:{round(atr,2)} {capped_reason}"
+                if is_shadow_promoted: log_msg += " [SHADOW_PROMOTED]"
 
                 if can_live:
                     dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", log_msg, ai_raw=raw_text)
                     
                     try:
                         order = self.alpaca.submit_order(
-                            symbol=symbol, qty=qty, side='buy', type='market', time_in_force='gtc', 
+                            symbol=symbol, qty=qty, side=side.lower(), type='market', time_in_force='gtc', 
                             order_class='bracket', 
                             take_profit={'limit_price': tp}, stop_loss={'stop_price': sl}
                         )
@@ -703,24 +792,23 @@ class TitanEngine:
                          await self.notifier.send_rejection(symbol, order.status, "Immediate Rejection Post-Submit")
                          continue
                     
-                    # --- V8.6.1: UPDATE INTRA-LOOP MEMORY ONLY ---
                     estimated_cost = qty * entry
                     intra_loop_committed_cash += estimated_cost
                     intra_loop_committed_risk += new_trade_risk
                     self.status["positions"]["live_titan"] += 1 
-                    # Note: We update pos count globally to gate next picks in this loop
-                    # But we DO NOT touch self.status['equity']['buying_power']
-                    # ---------------------------------------------
+                    if is_macro_mode: current_macro_count += 1 
 
-                    self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id, order.id, atr, regime)
-                    logger.info(f"LIVE [{regime}]: {symbol} Qty:{qty} TP:{tp} SL:{sl} {capped_reason} {clamped_msg}")
-                    await self.notifier.send_trade_entry(symbol, "BUY", qty, entry, thesis, regime)
+                    adaptive_tag = "MACRO" if is_macro_mode else "INIT"
+                    self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id, order.id, atr, regime, side, adaptive_tag)
+                    
+                    logger.info(f"LIVE [{mode_tag}]: {symbol} {side} Qty:{qty} TP:{tp} SL:{sl} {capped_reason}")
+                    await self.notifier.send_trade_entry(symbol, side, qty, entry, thesis, mode_tag)
                 else:
                     rej = "STRESS" if self.status["safety"]["market_stress"] else "CONF/LIMIT"
-                    if force_shadow: rej = force_reason # Override reason if forced
+                    if force_shadow: rej = force_reason 
                     
                     dec_id = self.db.log_decision(symbol, conf, thesis, "SHADOW", f"{rej} ({log_msg})", ai_raw=raw_text)
-                    self.db.log_trade(symbol, qty, entry, conf, thesis, "SHADOW", tp, sl, dec_id, None, atr, regime)
+                    self.db.log_trade(symbol, qty, entry, conf, thesis, "SHADOW", tp, sl, dec_id, None, atr, regime, side, "INIT")
                 
                 self.last_trade_per_symbol[symbol] = datetime.now()
                 
@@ -775,7 +863,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-RetailFortress v8.6.1 Ready. Global Risk Cap & Dust Recycling Active.")
+    logger.info(f"Titan-RetailGrind v8.6.5 Ready. Retail Scalp Mode Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
