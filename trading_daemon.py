@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.7.0 (PRO EXECUTION) ---
+# --- CONFIGURATION V8.7.3b (INSTITUTION GRADE) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,7 +22,7 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 
 CONFIG = {
-    "VERSION": "8.7.0-Pro-Execution",
+    "VERSION": "8.7.3b-Institution-Grade",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     
@@ -30,11 +30,15 @@ CONFIG = {
     "MAX_OPEN_POSITIONS": 5,           
     "MAX_MACRO_POSITIONS": 1,          
     "RISK_PCT_PER_TRADE": 2.0,       
-    "MAX_TOTAL_RISK_PCT": 6.0,         
+    "MAX_TOTAL_RISK_PCT": 6.0,
+    
+    # --- SOLVENCY GUARDS (NOUVEAU) ---
+    "MAX_CAPITAL_PER_TRADE_PCT": 25.0, # Max exposure per single trade
+    "MAX_TOTAL_EXPOSURE_PCT": 60.0,    # Max total exposure (Global Cap)
+
     "LIVE_THRESHOLD": 76,
     "MACRO_THRESHOLD": 85,             
     "MIN_TRADE_AMOUNT_USD": 150.0,
-    "TWO_PHASE_ENTRY_THRESHOLD": 100.0, # Trigger for 2-Phase Entry
     
     # --- KILL SWITCH 2-STAGES ---
     "MIN_WINRATE_THRESHOLD": 62.0,     
@@ -87,9 +91,9 @@ CONFIG = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_7_0.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_7_3b.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-Pro")
+logger = logging.getLogger("Titan-Institution")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -138,10 +142,10 @@ class NotificationManager:
                 if resp.status >= 400: logger.error(f"Webhook failed: {resp.status}")
         except Exception as e: logger.error(f"Notification error: {e}")
 
-    async def send_trade_entry(self, symbol, side, qty, price, thesis, regime, scout=False, execution_mode="BRACKET"):
+    async def send_trade_entry(self, symbol, side, qty, price, thesis, regime, scout=False):
         emoji = "🔭" if scout else ("📈" if side == "BUY" else "📉")
         title_sfx = " [SCOUT]" if scout else ""
-        msg = f"**Symbol:** {symbol}\n**Side:** {side}\n**Qty:** {qty}\n**Price:** ${price}\n**Regime:** {regime}\n**Mode:** {execution_mode}\n**Thesis:** {thesis}"
+        msg = f"**Symbol:** {symbol}\n**Side:** {side}\n**Qty:** {qty}\n**Price:** ${price}\n**Regime:** {regime}\n**Thesis:** {thesis}"
         await self.send(f"{emoji} Trade Entry{title_sfx}: {symbol}", msg, priority="TRADE")
 
     async def send_trade_exit(self, symbol, result, entry, exit_price, pnl_pct):
@@ -161,6 +165,9 @@ class NotificationManager:
         
     async def send_rejection(self, symbol, status, reason):
         await self.send(f"⚠️ Order Rejected: {symbol}", f"**Status:** {status}\n**Reason:** {reason}", priority="ERROR")
+    
+    async def send_emergency(self, symbol, reason):
+        await self.send("🚨 SENTINEL INTERVENTION", f"**EMERGENCY CLOSE TRIGGERED**\nSymbol: {symbol}\nReason: {reason}\n*System Halted for Audit.*", priority="CRITICAL")
 
 # --- ADAPTIVE MANAGER ---
 class AdaptiveManager:
@@ -184,7 +191,7 @@ class AdaptiveManager:
         elif regime == "RANGE": return "RANGE_SCALP"
         return "STANDARD"
 
-# --- PERSISTANCE (V8.7.0) ---
+# --- PERSISTANCE (V8.7.3b) ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
@@ -448,6 +455,59 @@ class TitanEngine:
 
         self.status["health"] = new_health
         return True
+    
+    # --- SENTINEL MODULE (V8.7.1) ---
+    async def verify_safety_protocol(self, symbol):
+        """
+        SENTINEL: Verifie si une position existe sans protection.
+        Si oui, déclenche EMERGENCY CLOSE et HALT.
+        """
+        logger.info(f"🛡️ SENTINEL: Verifying safety for {symbol}...")
+        await asyncio.sleep(2) # Laisse le temps au broker de traiter l'ordre
+        
+        try:
+            position = None
+            try:
+                position = self.alpaca.get_position(symbol)
+            except:
+                pass # Pas de position, c'est safe (ou rejeté)
+
+            if position:
+                open_orders = self.alpaca.list_orders(status='open', symbols=[symbol])
+                has_tp = any(o.type == 'limit' for o in open_orders)
+                has_sl = any(o.type == 'stop' for o in open_orders)
+                
+                # Check simple : doit avoir au moins un SL. Le TP est bonus mais SL obligatoire.
+                # Pour un bracket complet, on veut les deux.
+                is_safe = has_sl 
+                
+                if not is_safe:
+                    reason = f"UNPROTECTED POSITION DETECTED (No SL). Pos: {position.qty}"
+                    logger.critical(f"🚨 SENTINEL ALERT: {reason}")
+                    await self.emergency_close(symbol, reason)
+                else:
+                    logger.info(f"✅ SENTINEL: {symbol} is safe (SL present).")
+
+        except Exception as e:
+            logger.error(f"❌ SENTINEL ERROR: {e}")
+            # En cas de doute (erreur API sentinel), on HALT par précaution ? 
+            # Pour l'instant on log juste, pour ne pas halt sur un timeout.
+
+    async def emergency_close(self, symbol, reason):
+        """
+        LIQUIDATION D'URGENCE et HALT SYSTEME
+        """
+        try:
+            logger.warning(f"⚠️ EXECUTING EMERGENCY CLOSE ON {symbol}")
+            self.alpaca.cancel_all_orders() # Cancel any hanging orders first
+            self.alpaca.close_position(symbol) # Market close
+            
+            self.db.set_system_state(True, reason, "CRITICAL")
+            await self.notifier.send_emergency(symbol, reason)
+            
+        except Exception as e:
+            logger.critical(f"❌ EMERGENCY CLOSE FAILED: {e}")
+            # Ultimate fail safe not possible here easily without external monitor
 
     async def sync_data(self):
         try:
@@ -749,7 +809,12 @@ class TitanEngine:
         current_open_risk = 0.0
         current_macro_count = 0 
         
+        # V8.7.3b: CALCULATE GLOBAL EXPOSURE
+        current_exposure = 0.0
         for t in current_open_trades:
+            # On utilise entry_price comme proxy conservateur
+            current_exposure += t['qty'] * t['entry_price']
+            
             trade_risk = abs(t['entry_price'] - t['sl_price']) * t['qty']
             if trade_risk > 0: current_open_risk += trade_risk
             if t['adaptive_code'] == 'MACRO': current_macro_count += 1
@@ -766,6 +831,15 @@ class TitanEngine:
             if side == 'SELL' and not CONFIG["ALLOW_SHORTS"]:
                  self.db.log_decision(symbol, 0, p.get('reason',''), "SKIP", "SHORTS_DISABLED", ai_raw=raw_text)
                  continue
+
+            # V8.7.1: PRE-FLIGHT SHORT CHECK
+            if side == 'SELL':
+                try:
+                    account = self.alpaca.get_account()
+                    if not account.shorting_enabled:
+                         self.db.log_decision(symbol, 0, p.get('reason',''), "SKIP", "BROKER_RESTRICTION (Shorting Disabled)", ai_raw=raw_text)
+                         continue
+                except: pass
 
             conf, thesis = p.get('confidence', 0), p.get('reason', 'N/A')
             if not symbol: continue
@@ -845,7 +919,8 @@ class TitanEngine:
                 
                 if not is_macro_mode:
                     if sl_dist < CONFIG["MIN_SL_DISTANCE_USD"]:
-                        self.db.log_decision(symbol, conf, thesis, "SKIP", "SL_TOO_TIGHT", ai_raw=raw_text)
+                        debug_info = f"SL_TOO_TIGHT | ATR={round(atr, 4)} SL_Dist={round(sl_dist, 4)} Min=${CONFIG['MIN_SL_DISTANCE_USD']} Regime={regime}"
+                        self.db.log_decision(symbol, conf, thesis, "SKIP", debug_info, ai_raw=raw_text)
                         continue
                 
                 if sl_dist < (entry * 0.001): continue
@@ -869,10 +944,44 @@ class TitanEngine:
                 
                 effective_bp = current_bp_snapshot - intra_loop_committed_cash
                 max_affordable_qty = math.floor((effective_bp * 0.95) / entry)
-                qty = min(raw_qty, max_affordable_qty)
+
+                # V8.7.3: SINGLE TRADE EXPOSURE CAP
+                max_capital_usd = current_equity * (CONFIG["MAX_CAPITAL_PER_TRADE_PCT"] / 100.0)
+                max_qty_by_cap = math.floor(max_capital_usd / entry)
+                
+                # Triangular Constraint: Risk vs Wallet vs Exposure
+                qty = min(raw_qty, max_affordable_qty, max_qty_by_cap)
                 
                 force_shadow = False
                 force_reason = ""
+
+                # V8.7.3b: GLOBAL EXPOSURE CAP CHECK
+                new_trade_exposure = qty * entry
+                max_total_exposure = current_equity * (CONFIG["MAX_TOTAL_EXPOSURE_PCT"] / 100.0)
+                
+                if (current_exposure + new_trade_exposure) > max_total_exposure:
+                     # Calculate max qty allowed to stay under Global Cap
+                     remaining_exposure = max_total_exposure - current_exposure
+                     if remaining_exposure <= 0:
+                         self.db.log_decision(symbol, conf, thesis, "SKIP", f"GLOBAL_EXPOSURE_FULL ({round(current_exposure/current_equity*100,1)}%)", ai_raw=raw_text)
+                         continue
+                     
+                     # Reduce qty to fit global cap if necessary
+                     qty_limit_global = math.floor(remaining_exposure / entry)
+                     if qty > qty_limit_global:
+                         qty = qty_limit_global
+                         capped_reason += f" [GLOBAL_CAP_FIT]"
+                     
+                     if qty < 1:
+                          self.db.log_decision(symbol, conf, thesis, "SKIP", f"GLOBAL_EXPOSURE_CAP ({round((current_exposure)/current_equity*100,1)}%)", ai_raw=raw_text)
+                          continue
+
+                # Analyze Capping Source (V8.7.3b Enhanced Logging)
+                if qty < raw_qty:
+                    if qty == max_qty_by_cap:
+                        capped_reason += f" [SINGLE_CAP: {CONFIG['MAX_CAPITAL_PER_TRADE_PCT']}%]"
+                    elif qty == max_affordable_qty:
+                        capped_reason += f" [Cash Drag]"
                 
                 if (qty * entry) < CONFIG["MIN_TRADE_AMOUNT_USD"]:
                     if not is_macro_mode and not is_scout_trade:
@@ -880,12 +989,14 @@ class TitanEngine:
                         force_reason = f"DUST_RETAIL (<${CONFIG['MIN_TRADE_AMOUNT_USD']})"
                     else:
                         capped_reason += " [Micro-Pos Allowed]"
-
-                if qty < raw_qty:
-                    capped_reason += f" [Cash Drag: Risk ${round(qty*sl_dist, 2)}]"
                 
                 if qty < 1 and not force_shadow:
-                    self.db.log_decision(symbol, conf, thesis, "SKIP", "INSUFFICIENT_FUNDS", ai_raw=raw_text)
+                    # V8.7.3b: SPECIFIC SOLVENCY LOGGING
+                    reason_tag = "INSUFFICIENT_FUNDS"
+                    if qty == max_qty_by_cap: reason_tag = "SKIP: SOLVENCY_CAP_HIT"
+                    
+                    debug_info = f"{reason_tag} | Price=${entry} Equity=${round(current_equity,0)}"
+                    self.db.log_decision(symbol, conf, thesis, "SKIP", debug_info, ai_raw=raw_text)
                     continue
 
                 new_trade_risk = qty * sl_dist
@@ -922,68 +1033,12 @@ class TitanEngine:
                     dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", log_msg, ai_raw=raw_text)
                     
                     try:
-                        # V8.7.0: TWO-PHASE ENTRY FOR HIGH PRICED SYMBOLS
-                        use_2_phase = entry > CONFIG["TWO_PHASE_ENTRY_THRESHOLD"]
-                        
-                        if use_2_phase:
-                            # Phase 1: Pure Market Entry
-                            entry_order = self.alpaca.submit_order(
-                                symbol=symbol, qty=qty, side=side.lower(), type='market', time_in_force='gtc'
-                            )
-                            logger.info(f"PHASE 1 (Market) Sent: {symbol}")
-                            
-                            # Phase 2: Wait for Fill
-                            filled_order = None
-                            wait_attempts = 0
-                            while wait_attempts < 20: # 10 seconds timeout
-                                await asyncio.sleep(0.5)
-                                try:
-                                    o = self.alpaca.get_order(entry_order.id)
-                                    if o.status == 'filled':
-                                        filled_order = o
-                                        break
-                                    if o.status in ['canceled', 'rejected', 'expired']:
-                                        break
-                                except: pass
-                                wait_attempts += 1
-                            
-                            if not filled_order:
-                                logger.error(f"❌ Phase 2 Fail: Timeout/Reject on {symbol}")
-                                self.alpaca.cancel_order(entry_order.id)
-                                continue
-
-                            # Phase 3: Calc & OCO Exit
-                            fill_price = float(filled_order.filled_avg_price)
-                            
-                            if side == "BUY":
-                                real_tp = max(round(fill_price + tp_dist, 2), round(fill_price + 0.02, 2))
-                                real_sl = min(round(fill_price - sl_dist, 2), round(fill_price - 0.02, 2))
-                                exit_side = "sell"
-                            else:
-                                real_tp = min(round(fill_price - tp_dist, 2), round(fill_price - 0.02, 2))
-                                real_sl = max(round(fill_price + sl_dist, 2), round(fill_price + 0.02, 2))
-                                exit_side = "buy"
-
-                            self.alpaca.submit_order(
-                                symbol=symbol, qty=qty, side=exit_side, 
-                                type='limit', limit_price=real_tp, 
-                                order_class='oco', 
-                                stop_loss={'stop_price': real_sl},
-                                time_in_force='gtc'
-                            )
-                            order = entry_order # For logging consistency
-                            tp, sl, entry = real_tp, real_sl, fill_price # Update vars for DB log
-                            execution_mode = "2-PHASE-OCO"
-
-                        else:
-                            # Standard Bracket Entry
-                            order = self.alpaca.submit_order(
-                                symbol=symbol, qty=qty, side=side.lower(), type='market', time_in_force='gtc', 
-                                order_class='bracket', 
-                                take_profit={'limit_price': tp}, stop_loss={'stop_price': sl}
-                            )
-                            execution_mode = "BRACKET"
-
+                        # V8.7.1: STRICT BRACKET ONLY - NO 2-PHASE
+                        order = self.alpaca.submit_order(
+                            symbol=symbol, qty=qty, side=side.lower(), type='market', time_in_force='gtc', 
+                            order_class='bracket', 
+                            take_profit={'limit_price': tp}, stop_loss={'stop_price': sl}
+                        )
                     except APIError as e:
                         self.db.log_decision(symbol, conf, thesis, "LIVE_API_ERROR", str(e), ai_raw=raw_text)
                         await self.notifier.send_rejection(symbol, "API_ERROR", str(e))
@@ -995,6 +1050,9 @@ class TitanEngine:
                          await self.notifier.send_rejection(symbol, order.status, "Immediate Rejection Post-Submit")
                          continue
                     
+                    # --- SENTINEL POST-FLIGHT CHECK ---
+                    asyncio.create_task(self.verify_safety_protocol(symbol))
+
                     estimated_cost = qty * entry
                     intra_loop_committed_cash += estimated_cost
                     intra_loop_committed_risk += new_trade_risk
@@ -1004,8 +1062,8 @@ class TitanEngine:
                     adaptive_tag = "MACRO" if is_macro_mode else "INIT"
                     self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id, order.id, atr, regime, side, adaptive_tag)
                     
-                    logger.info(f"LIVE [{mode_tag}] ({execution_mode}): {symbol} {side} Qty:{qty} TP:{tp} SL:{sl} {capped_reason}")
-                    await self.notifier.send_trade_entry(symbol, side, qty, entry, thesis, mode_tag, scout=is_scout_trade, execution_mode=execution_mode)
+                    logger.info(f"LIVE [{mode_tag}] (BRACKET): {symbol} {side} Qty:{qty} TP:{tp} SL:{sl} {capped_reason}")
+                    await self.notifier.send_trade_entry(symbol, side, qty, entry, thesis, mode_tag, scout=is_scout_trade)
                 else:
                     rej = "STRESS" if self.status["safety"]["market_stress"] else "CONF/LIMIT"
                     if force_shadow: rej = force_reason 
@@ -1066,7 +1124,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Pro v8.7.0 Ready. Two-Phase Execution Active.")
+    logger.info(f"Titan-Institution v8.7.3b Ready. Global Exposure Cap Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
