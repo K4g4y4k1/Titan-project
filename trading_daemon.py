@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.7.4 (CLEAR DEFCON) ---
+# --- CONFIGURATION V8.8.1 (RETAIL PATCH) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,7 +22,8 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 
 CONFIG = {
-    "VERSION": "8.7.4-Clear-Defcon",
+    "VERSION": "8.8.1-Retail-Patch",
+    "LEARNING_EPOCH": 1,               
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     
@@ -33,12 +34,13 @@ CONFIG = {
     "MAX_TOTAL_RISK_PCT": 6.0,
     
     # --- SOLVENCY GUARDS ---
-    "MAX_CAPITAL_PER_TRADE_PCT": 25.0, # Max exposure per single trade (Preventive)
-    "MAX_TOTAL_EXPOSURE_PCT": 60.0,    # Max total exposure (Global Cap)
+    "MAX_CAPITAL_PER_TRADE_PCT": 25.0, 
+    "MAX_TOTAL_EXPOSURE_PCT": 60.0,    
 
     "LIVE_THRESHOLD": 76,
     "MACRO_THRESHOLD": 85,             
     "MIN_TRADE_AMOUNT_USD": 150.0,
+    "MIN_SL_DISTANCE_USD": 0.05,        # SL Floor Baseline
     
     # --- KILL SWITCH 2-STAGES ---
     "MIN_WINRATE_THRESHOLD": 62.0,     
@@ -61,16 +63,17 @@ CONFIG = {
     "ATR_PERIOD": 14,
     "ALLOW_SHORTS": True,
     
-    # --- CALIBRATION REGIMES ---
+    # --- CALIBRATION REGIMES (PATCH #2: TP Range Reduced) ---
     "REGIME_CONFIG": {
         "TREND": {"TP_MULT": 2.5, "SL_MULT": 1.2, "DESC": "Trend Following", "TRAILING": True},
-        "RANGE": {"TP_MULT": 0.8, "SL_MULT": 1.3, "DESC": "Retail Scalp (Hardened)", "TRAILING": False},
+        # V8.8.1: TP 0.8 -> 0.55 | SL 1.3 -> 1.2
+        "RANGE": {"TP_MULT": 0.55, "SL_MULT": 1.2, "DESC": "Retail Scalp (Hardened)", "TRAILING": False},
         "CHOP":  {"TP_MULT": 0.0, "SL_MULT": 0.0, "DESC": "No trade zone", "TRAILING": False},
         "MACRO": {"TP_MULT": 6.0, "SL_MULT": 4.0, "DESC": "Macro Structural", "TRAILING": False} 
     },
     
     "BE_TRIGGER_ATR_STD": 0.5,
-    "BE_TRIGGER_ATR_RANGE": 0.35, 
+    "BE_TRIGGER_ATR_RANGE": 0.25, # PATCH #3: Earlier BE (0.35 -> 0.25)
     
     "TRAILING_STEP_ATR": 0.5,
     "ENABLE_ADAPTIVE_GOVERNOR": True,
@@ -82,7 +85,6 @@ CONFIG = {
     "MAX_SL_UPDATES_PER_TRADE": 20,
     "HEARTBEAT_INTERVAL_MIN": 60,
     "NOTIFY_LEVEL": "INFO",
-    "MIN_SL_DISTANCE_USD": 0.05,
     "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
     "AI_MODEL": "openai/gpt-5.2-chat",
     "SCAN_INTERVAL": 60 
@@ -91,9 +93,9 @@ CONFIG = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_7_4.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_8_1.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-Defcon")
+logger = logging.getLogger("Titan-RetailPatch")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -132,7 +134,7 @@ class NotificationManager:
                 "title": f"[{CONFIG['ENV_MODE']}] {title}",
                 "description": message,
                 "color": color,
-                "footer": {"text": f"Titan v{CONFIG['VERSION']}"},
+                "footer": {"text": f"Titan v{CONFIG['VERSION']} | Epoch {CONFIG['LEARNING_EPOCH']}"},
                 "timestamp": datetime.utcnow().isoformat()
             }]
         }
@@ -148,9 +150,10 @@ class NotificationManager:
         msg = f"**Symbol:** {symbol}\n**Side:** {side}\n**Qty:** {qty}\n**Price:** ${price}\n**Regime:** {regime}\n**Thesis:** {thesis}"
         await self.send(f"{emoji} Trade Entry{title_sfx}: {symbol}", msg, priority="TRADE")
 
-    async def send_trade_exit(self, symbol, result, entry, exit_price, pnl_pct):
+    async def send_trade_exit(self, symbol, result, entry, exit_price, pnl_pct, mae=0.0, mfe=0.0):
         emoji = "💰" if result == "TP" else "🛑"
-        msg = f"**Result:** {result}\n**Entry:** ${entry}\n**Exit:** ${exit_price}\n**Move:** {pnl_pct}%"
+        stats = f"\n*MAE: {mae}% | MFE: {mfe}%*"
+        msg = f"**Result:** {result}\n**Entry:** ${entry}\n**Exit:** ${exit_price}\n**Move:** {pnl_pct}%{stats}"
         await self.send(f"{emoji} Trade Closed: {symbol}", msg, priority="TRADE")
 
     async def send_heartbeat(self, status, equity, pnl_day, spy_vol, buying_power):
@@ -191,7 +194,7 @@ class AdaptiveManager:
         elif regime == "RANGE": return "RANGE_SCALP"
         return "STANDARD"
 
-# --- PERSISTANCE (V8.7.4) ---
+# --- PERSISTANCE ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
@@ -216,6 +219,17 @@ class TitanDatabase:
                     side TEXT DEFAULT 'BUY'
                 )
             """)
+            try: conn.execute("ALTER TABLE trades ADD COLUMN side TEXT DEFAULT 'BUY'")
+            except sqlite3.OperationalError: pass
+            try: conn.execute("ALTER TABLE trades ADD COLUMN lowest_price REAL")
+            except sqlite3.OperationalError: pass
+            try: conn.execute("ALTER TABLE trades ADD COLUMN epoch_id INTEGER DEFAULT 0")
+            except sqlite3.OperationalError: pass
+            try: conn.execute("ALTER TABLE trades ADD COLUMN mae REAL DEFAULT 0.0")
+            except sqlite3.OperationalError: pass
+            try: conn.execute("ALTER TABLE trades ADD COLUMN mfe REAL DEFAULT 0.0")
+            except sqlite3.OperationalError: pass
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS ai_decision_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -231,24 +245,19 @@ class TitanDatabase:
             conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('halt_reason', '')")
             conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('system_health', 'HEALTHY')")
             conn.commit()
-            
-            try: conn.execute("ALTER TABLE trades ADD COLUMN side TEXT DEFAULT 'BUY'")
-            except sqlite3.OperationalError: pass
-            try: conn.execute("ALTER TABLE trades ADD COLUMN lowest_price REAL")
-            except sqlite3.OperationalError: pass
 
     def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id, order_id, atr, regime, side, adaptive_code="INIT"):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""INSERT INTO trades 
-                (symbol, qty, entry_price, confidence, thesis, mode, tp_price, sl_price, status, decision_id, alpaca_order_id, atr_at_entry, market_regime, highest_price, lowest_price, sl_updates_count, adaptive_code, adaptive_reason, side) 
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,'Initialized',?)""",
-                (symbol, qty, price, conf, thesis, mode, tp, sl, 'OPEN', dec_id, order_id, atr, regime, price, price, adaptive_code, side))
+                (symbol, qty, entry_price, confidence, thesis, mode, tp_price, sl_price, status, decision_id, alpaca_order_id, atr_at_entry, market_regime, highest_price, lowest_price, sl_updates_count, adaptive_code, adaptive_reason, side, epoch_id, mae, mfe) 
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,'Initialized',?,?,0.0,0.0)""",
+                (symbol, qty, price, conf, thesis, mode, tp, sl, 'OPEN', dec_id, order_id, atr, regime, price, price, adaptive_code, side, CONFIG["LEARNING_EPOCH"]))
             conn.commit()
 
-    def update_trade_stats(self, trade_id, highest_price, lowest_price, new_sl, be_active, update_count, adaptive_code=None, adaptive_reason=None):
+    def update_trade_stats(self, trade_id, highest_price, lowest_price, new_sl, be_active, update_count, mae, mfe, adaptive_code=None, adaptive_reason=None):
         with sqlite3.connect(self.db_path) as conn:
-            sql = "UPDATE trades SET highest_price=?, lowest_price=?, sl_price=?, is_be_active=?, sl_updates_count=?"
-            params = [highest_price, lowest_price, new_sl, 1 if be_active else 0, update_count]
+            sql = "UPDATE trades SET highest_price=?, lowest_price=?, sl_price=?, is_be_active=?, sl_updates_count=?, mae=?, mfe=?"
+            params = [highest_price, lowest_price, new_sl, 1 if be_active else 0, update_count, mae, mfe]
             if adaptive_code:
                 sql += ", adaptive_code=?, adaptive_reason=?"
                 params.extend([adaptive_code, adaptive_reason])
@@ -257,12 +266,12 @@ class TitanDatabase:
             conn.execute(sql, tuple(params))
             conn.commit()
 
-    def close_trade(self, trade_id, exit_price, result):
+    def close_trade(self, trade_id, exit_price, result, final_mae, final_mfe):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
-                UPDATE trades SET status='CLOSED', exit_price=?, result=?, exit_time=CURRENT_TIMESTAMP 
+                UPDATE trades SET status='CLOSED', exit_price=?, result=?, mae=?, mfe=?, exit_time=CURRENT_TIMESTAMP 
                 WHERE id=?
-            """, (exit_price, result, trade_id))
+            """, (exit_price, result, final_mae, final_mfe, trade_id))
             conn.commit()
 
     def get_open_trades(self, mode=None):
@@ -304,9 +313,10 @@ class TitanDatabase:
             conn.row_factory = sqlite3.Row
             trades = conn.execute("""
                 SELECT result, entry_price, exit_price, side FROM trades 
-                WHERE mode='LIVE' AND status='CLOSED' 
+                WHERE mode='LIVE' AND status='CLOSED' AND epoch_id >= ? 
                 ORDER BY exit_time DESC LIMIT ?
-            """, (limit,)).fetchall()
+            """, (CONFIG["LEARNING_EPOCH"], limit,)).fetchall()
+            
             if not trades: return None, 0.0, 0
             total = len(trades)
             wins = 0
@@ -385,6 +395,7 @@ class TitanEngine:
         is_halted, reason, health = self.db.get_system_state()
         self.status = {
             "version": CONFIG["VERSION"],
+            "epoch": CONFIG["LEARNING_EPOCH"],
             "state": "HALTED" if is_halted else "INIT",
             "health": health,
             "market": "CLOSED",
@@ -456,29 +467,19 @@ class TitanEngine:
         self.status["health"] = new_health
         return True
     
-    # --- SENTINEL MODULE (V8.7.1) ---
+    # --- SENTINEL MODULE ---
     async def verify_safety_protocol(self, symbol):
-        """
-        SENTINEL: Verifie si une position existe sans protection.
-        Si oui, déclenche EMERGENCY CLOSE et HALT.
-        """
         logger.info(f"🛡️ SENTINEL: Verifying safety for {symbol}...")
-        await asyncio.sleep(2) # Laisse le temps au broker de traiter l'ordre
-        
+        await asyncio.sleep(2) 
         try:
             position = None
-            try:
-                position = self.alpaca.get_position(symbol)
-            except:
-                pass # Pas de position, c'est safe (ou rejeté)
+            try: position = self.alpaca.get_position(symbol)
+            except: pass 
 
             if position:
                 open_orders = self.alpaca.list_orders(status='open', symbols=[symbol])
                 has_tp = any(o.type == 'limit' for o in open_orders)
                 has_sl = any(o.type == 'stop' for o in open_orders)
-                
-                # Check simple : doit avoir au moins un SL. Le TP est bonus mais SL obligatoire.
-                # Pour un bracket complet, on veut les deux.
                 is_safe = has_sl 
                 
                 if not is_safe:
@@ -487,27 +488,16 @@ class TitanEngine:
                     await self.emergency_close(symbol, reason)
                 else:
                     logger.info(f"✅ SENTINEL: {symbol} is safe (SL present).")
-
-        except Exception as e:
-            logger.error(f"❌ SENTINEL ERROR: {e}")
-            # En cas de doute (erreur API sentinel), on HALT par précaution ? 
-            # Pour l'instant on log juste, pour ne pas halt sur un timeout.
+        except Exception as e: logger.error(f"❌ SENTINEL ERROR: {e}")
 
     async def emergency_close(self, symbol, reason):
-        """
-        LIQUIDATION D'URGENCE et HALT SYSTEME
-        """
         try:
             logger.warning(f"⚠️ EXECUTING EMERGENCY CLOSE ON {symbol}")
-            self.alpaca.cancel_all_orders() # Cancel any hanging orders first
-            self.alpaca.close_position(symbol) # Market close
-            
+            self.alpaca.cancel_all_orders() 
+            self.alpaca.close_position(symbol) 
             self.db.set_system_state(True, reason, "CRITICAL")
             await self.notifier.send_emergency(symbol, reason)
-            
-        except Exception as e:
-            logger.critical(f"❌ EMERGENCY CLOSE FAILED: {e}")
-            # Ultimate fail safe not possible here easily without external monitor
+        except Exception as e: logger.critical(f"❌ EMERGENCY CLOSE FAILED: {e}")
 
     async def sync_data(self):
         try:
@@ -517,14 +507,11 @@ class TitanEngine:
             start_eq = self.db.get_or_create_daily_stats(eq)
             pnl_pct = ((eq - start_eq) / start_eq * 100) if start_eq > 0 else 0.0
             
-            # --- V8.7.4: AUDIT CONTINU DE L'EXPOSITION (POST-TRADE DETECTION) ---
-            # Protection ultime : Si malgré le SKIP, on est surexposé, on HALT.
-            # C'est la différence entre "Prévention" et "Détection".
+            # Exposure Check
             positions = self.alpaca.list_positions()
             real_exposure = sum([float(p.market_value) for p in positions])
             max_exposure_usd = eq * (CONFIG["MAX_TOTAL_EXPOSURE_PCT"] / 100.0)
             
-            # Tolérance de 5% pour fluctuations de marché post-entrée
             if real_exposure > (max_exposure_usd * 1.05):
                 is_halted, _, _ = self.db.get_system_state()
                 if not is_halted:
@@ -599,6 +586,28 @@ class TitanEngine:
         atr = t['atr_at_entry']
         if atr <= 0: return
 
+        # MAE / MFE Calculation Logic
+        entry_p = t['entry_price']
+        highest = t['highest_price'] if t['highest_price'] else entry_p
+        lowest = t['lowest_price'] if t['lowest_price'] else entry_p
+        
+        highest = max(highest, current_price)
+        lowest = min(lowest, current_price)
+
+        mae = 0.0
+        mfe = 0.0
+        
+        if trade_side == "BUY":
+            adverse_move = lowest - entry_p
+            favorable_move = highest - entry_p
+            mae = (adverse_move / entry_p) * 100 
+            mfe = (favorable_move / entry_p) * 100 
+        else:
+            adverse_move = entry_p - highest 
+            favorable_move = entry_p - lowest
+            mae = (adverse_move / entry_p) * 100 
+            mfe = (favorable_move / entry_p) * 100 
+
         # Adaptive Logic
         use_adaptive = CONFIG["ENABLE_ADAPTIVE_GOVERNOR"]
         if t['mode'] == 'SHADOW' and not CONFIG["ENABLE_ADAPTIVE_SHADOW"]: use_adaptive = False
@@ -627,22 +636,15 @@ class TitanEngine:
         trailing_offset_mult = profile["trailing_mult_offset"]
         adaptive_desc = profile["desc"]
         
-        entry = t['entry_price']
         current_sl = t['sl_price']
         new_sl = current_sl
         update_needed = False
         is_be = bool(t['is_be_active'])
         
-        highest = t['highest_price'] if t['highest_price'] is not None else entry
-        lowest = t['lowest_price'] if t['lowest_price'] is not None else entry
-        
-        highest = max(highest, current_price)
-        lowest = min(lowest, current_price)
-
         # --- LOGIC FOR BUY (LONG) ---
         if trade_side == "BUY":
-            if not is_be and (current_price >= entry + (atr * be_trigger)):
-                new_sl = entry 
+            if not is_be and (current_price >= entry_p + (atr * be_trigger)):
+                new_sl = entry_p 
                 is_be = True
                 update_needed = True
                 await self.notifier.send(f"🛡️ Break-Even (LONG): {t['symbol']}", f"Profile: {profile_code}. SL -> Entry.", priority="TRADE")
@@ -660,8 +662,8 @@ class TitanEngine:
 
         # --- LOGIC FOR SELL (SHORT) ---
         elif trade_side == "SELL":
-            if not is_be and (current_price <= entry - (atr * be_trigger)):
-                new_sl = entry
+            if not is_be and (current_price <= entry_p - (atr * be_trigger)):
+                new_sl = entry_p
                 is_be = True
                 update_needed = True
                 await self.notifier.send(f"🛡️ Break-Even (SHORT): {t['symbol']}", f"Profile: {profile_code}. SL -> Entry.", priority="TRADE")
@@ -697,7 +699,7 @@ class TitanEngine:
         bounds_changed = (highest != t['highest_price']) or (lowest != t['lowest_price'])
         
         if success or bounds_changed:
-            self.db.update_trade_stats(t['id'], highest, lowest, new_sl, is_be, current_updates + (1 if success else 0), code_to_save, reason_to_save)
+            self.db.update_trade_stats(t['id'], highest, lowest, new_sl, is_be, current_updates + (1 if success else 0), mae, mfe, code_to_save, reason_to_save)
 
     async def reconcile_trades(self):
         trades = self.db.get_open_trades()
@@ -709,6 +711,9 @@ class TitanEngine:
             symbol = t['symbol']
             trade_side = t['side']
             
+            final_mae = t['mae'] if t['mae'] else 0.0
+            final_mfe = t['mfe'] if t['mfe'] else 0.0
+
             if t['mode'] == 'LIVE' and symbol not in live_positions:
                 activities = self.alpaca.get_activities(activity_types='FILL')
                 symbol_fills = [f for f in activities if f.symbol == symbol]
@@ -717,7 +722,7 @@ class TitanEngine:
                     try:
                         order = self.alpaca.get_order(t['alpaca_order_id'])
                         if order.status in ['canceled', 'expired', 'rejected']:
-                            self.db.close_trade(t['id'], 0, "VOID")
+                            self.db.close_trade(t['id'], 0, "VOID", 0, 0)
                             continue
                     except: pass
 
@@ -727,12 +732,18 @@ class TitanEngine:
                     if trade_side == "BUY":
                         res = "TP" if exit_price >= t['entry_price'] else "SL"
                         move_pct = round((exit_price - t['entry_price']) / t['entry_price'] * 100, 2)
+                        final_mae = min(final_mae, (exit_price - t['entry_price'])/t['entry_price']*100) 
                     else: # SELL
                         res = "TP" if exit_price <= t['entry_price'] else "SL"
-                        move_pct = round((t['entry_price'] - exit_price) / t['entry_price'] * 100, 2) 
+                        move_pct = round((t['entry_price'] - exit_price) / t['entry_price'] * 100, 2)
+                        final_mae = min(final_mae, (t['entry_price'] - exit_price)/t['entry_price']*100)
 
-                    self.db.close_trade(t['id'], exit_price, res)
-                    await self.notifier.send_trade_exit(symbol, res, t['entry_price'], exit_price, move_pct)
+                    # PATCH #5: MFE Analysis Post-Mortem
+                    if res == 'SL' and final_mfe > 0.25:
+                        logger.warning(f"⚠️ GOOD IDEA, BAD EXIT: {symbol} MFE={round(final_mfe,2)}%")
+
+                    self.db.close_trade(t['id'], exit_price, res, final_mae, final_mfe)
+                    await self.notifier.send_trade_exit(symbol, res, t['entry_price'], exit_price, move_pct, round(final_mae, 2), round(final_mfe, 2))
                 continue
 
             try:
@@ -744,17 +755,17 @@ class TitanEngine:
                     is_closed = False
                     if trade_side == "BUY":
                         if current_price >= t['tp_price']: 
-                            self.db.close_trade(t['id'], current_price, "TP")
+                            self.db.close_trade(t['id'], current_price, "TP", final_mae, final_mfe)
                             is_closed = True
                         elif current_price <= t['sl_price']: 
-                            self.db.close_trade(t['id'], current_price, "SL")
+                            self.db.close_trade(t['id'], current_price, "SL", final_mae, final_mfe)
                             is_closed = True
                     else: # SELL
                         if current_price <= t['tp_price']: 
-                            self.db.close_trade(t['id'], current_price, "TP")
+                            self.db.close_trade(t['id'], current_price, "TP", final_mae, final_mfe)
                             is_closed = True
                         elif current_price >= t['sl_price']: 
-                            self.db.close_trade(t['id'], current_price, "SL")
+                            self.db.close_trade(t['id'], current_price, "SL", final_mae, final_mfe)
                             is_closed = True
 
                     if not is_closed:
@@ -825,7 +836,6 @@ class TitanEngine:
         current_open_risk = 0.0
         current_macro_count = 0 
         
-        # V8.7.3b: CALCULATE GLOBAL EXPOSURE (PRE-TRADE ESTIMATE)
         current_exposure = 0.0
         for t in current_open_trades:
             current_exposure += t['qty'] * t['entry_price']
@@ -932,9 +942,16 @@ class TitanEngine:
                 
                 if not is_macro_mode:
                     if sl_dist < CONFIG["MIN_SL_DISTANCE_USD"]:
-                        debug_info = f"SL_TOO_TIGHT | ATR={round(atr, 4)} SL_Dist={round(sl_dist, 4)} Min=${CONFIG['MIN_SL_DISTANCE_USD']} Regime={regime}"
-                        self.db.log_decision(symbol, conf, thesis, "SKIP", debug_info, ai_raw=raw_text)
-                        continue
+                        # PATCH #1: SL Floor for Range/Live
+                        if regime == "RANGE" and conf >= CONFIG["LIVE_THRESHOLD"]:
+                             sl_dist = CONFIG["MIN_SL_DISTANCE_USD"]
+                             if side == "BUY": sl = round(entry - sl_dist, 2)
+                             else: sl = round(entry + sl_dist, 2)
+                             capped_reason += " [SL_FLOOR_APPLIED]"
+                        else:
+                            debug_info = f"SL_TOO_TIGHT | ATR={round(atr, 4)} SL_Dist={round(sl_dist, 4)} Min=${CONFIG['MIN_SL_DISTANCE_USD']} Regime={regime}"
+                            self.db.log_decision(symbol, conf, thesis, "SKIP", debug_info, ai_raw=raw_text)
+                            continue
                 
                 if sl_dist < (entry * 0.001): continue
                 
@@ -958,7 +975,6 @@ class TitanEngine:
                 effective_bp = current_bp_snapshot - intra_loop_committed_cash
                 max_affordable_qty = math.floor((effective_bp * 0.95) / entry)
 
-                # V8.7.3: SINGLE TRADE EXPOSURE CAP
                 max_capital_usd = current_equity * (CONFIG["MAX_CAPITAL_PER_TRADE_PCT"] / 100.0)
                 max_qty_by_cap = math.floor(max_capital_usd / entry)
                 
@@ -967,14 +983,18 @@ class TitanEngine:
                 force_shadow = False
                 force_reason = ""
 
-                # V8.7.4: GLOBAL EXPOSURE CAP (PREVENTIVE CHECK - NO HALT)
+                # PATCH #4: Micro-Edge Filter
+                potential_gain_usd = qty * tp_dist
+                if potential_gain_usd < 0.20 and not force_shadow:
+                    force_shadow = True
+                    force_reason = f"MICRO_EDGE_TOO_SMALL (Pot. Gain ${round(potential_gain_usd, 2)} < $0.20)"
+
                 new_trade_exposure = qty * entry
                 max_total_exposure = current_equity * (CONFIG["MAX_TOTAL_EXPOSURE_PCT"] / 100.0)
                 
                 if (current_exposure + new_trade_exposure) > max_total_exposure:
                      remaining_exposure = max_total_exposure - current_exposure
                      if remaining_exposure <= 0:
-                         # Change from HIT/FULL to ACTIVE/GUARD to avoid confusing audit
                          self.db.log_decision(symbol, conf, thesis, "SKIP", f"SOLVENCY_GUARD_ACTIVE (Global Exp {round(current_exposure/current_equity*100,1)}%)", ai_raw=raw_text)
                          continue
                      
@@ -1001,7 +1021,6 @@ class TitanEngine:
                         capped_reason += " [Micro-Pos Allowed]"
                 
                 if qty < 1 and not force_shadow:
-                    # V8.7.4: CLEAR SEMANTIC LOGGING (PASSIVE PROTECTION)
                     reason_tag = "INSUFFICIENT_FUNDS"
                     if qty == max_qty_by_cap: reason_tag = "SKIP: SOLVENCY_GUARD_ACTIVE"
                     
@@ -1133,7 +1152,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Defcon v8.7.4 Ready. Clear Solvency Logs Active.")
+    logger.info(f"Titan-RetailPatch v8.8.1 Ready. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
