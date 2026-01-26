@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.7.3b (INSTITUTION GRADE) ---
+# --- CONFIGURATION V8.7.4 (CLEAR DEFCON) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,7 +22,7 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 
 CONFIG = {
-    "VERSION": "8.7.3b-Institution-Grade",
+    "VERSION": "8.7.4-Clear-Defcon",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     
@@ -32,8 +32,8 @@ CONFIG = {
     "RISK_PCT_PER_TRADE": 2.0,       
     "MAX_TOTAL_RISK_PCT": 6.0,
     
-    # --- SOLVENCY GUARDS (NOUVEAU) ---
-    "MAX_CAPITAL_PER_TRADE_PCT": 25.0, # Max exposure per single trade
+    # --- SOLVENCY GUARDS ---
+    "MAX_CAPITAL_PER_TRADE_PCT": 25.0, # Max exposure per single trade (Preventive)
     "MAX_TOTAL_EXPOSURE_PCT": 60.0,    # Max total exposure (Global Cap)
 
     "LIVE_THRESHOLD": 76,
@@ -84,16 +84,16 @@ CONFIG = {
     "NOTIFY_LEVEL": "INFO",
     "MIN_SL_DISTANCE_USD": 0.05,
     "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
-    "AI_MODEL": "deepseek/deepseek-v3.2",
+    "AI_MODEL": "openai/gpt-5.2-chat",
     "SCAN_INTERVAL": 60 
 }
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_7_3b.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_7_4.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-Institution")
+logger = logging.getLogger("Titan-Defcon")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -191,7 +191,7 @@ class AdaptiveManager:
         elif regime == "RANGE": return "RANGE_SCALP"
         return "STANDARD"
 
-# --- PERSISTANCE (V8.7.3b) ---
+# --- PERSISTANCE (V8.7.4) ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
@@ -517,6 +517,22 @@ class TitanEngine:
             start_eq = self.db.get_or_create_daily_stats(eq)
             pnl_pct = ((eq - start_eq) / start_eq * 100) if start_eq > 0 else 0.0
             
+            # --- V8.7.4: AUDIT CONTINU DE L'EXPOSITION (POST-TRADE DETECTION) ---
+            # Protection ultime : Si malgré le SKIP, on est surexposé, on HALT.
+            # C'est la différence entre "Prévention" et "Détection".
+            positions = self.alpaca.list_positions()
+            real_exposure = sum([float(p.market_value) for p in positions])
+            max_exposure_usd = eq * (CONFIG["MAX_TOTAL_EXPOSURE_PCT"] / 100.0)
+            
+            # Tolérance de 5% pour fluctuations de marché post-entrée
+            if real_exposure > (max_exposure_usd * 1.05):
+                is_halted, _, _ = self.db.get_system_state()
+                if not is_halted:
+                    reason = f"CRITICAL EXPOSURE BREACH ({round(real_exposure,0)} > {round(max_exposure_usd,0)})"
+                    self.db.set_system_state(True, reason, "CRITICAL")
+                    logger.critical(f"🛑 SYSTEM HALTED: {reason}")
+                    await self.notifier.send_halt(reason)
+            
             if pnl_pct <= CONFIG["MAX_DAILY_DRAWDOWN_PCT"]:
                 is_halted, _, _ = self.db.get_system_state()
                 if not is_halted:
@@ -554,7 +570,7 @@ class TitanEngine:
                 "market": "OPEN" if is_open else "CLOSED",
                 "equity": {"current": round(eq, 2), "pnl_pct": round(pnl_pct, 2), "buying_power": round(bp, 2)},
                 "positions": {
-                    "live_broker": len(self.alpaca.list_positions()), 
+                    "live_broker": len(positions), 
                     "live_titan": stats['live_open_count'],           
                     "shadow_open": stats['shadow_open_count']
                 },
@@ -809,12 +825,10 @@ class TitanEngine:
         current_open_risk = 0.0
         current_macro_count = 0 
         
-        # V8.7.3b: CALCULATE GLOBAL EXPOSURE
+        # V8.7.3b: CALCULATE GLOBAL EXPOSURE (PRE-TRADE ESTIMATE)
         current_exposure = 0.0
         for t in current_open_trades:
-            # On utilise entry_price comme proxy conservateur
             current_exposure += t['qty'] * t['entry_price']
-            
             trade_risk = abs(t['entry_price'] - t['sl_price']) * t['qty']
             if trade_risk > 0: current_open_risk += trade_risk
             if t['adaptive_code'] == 'MACRO': current_macro_count += 1
@@ -832,7 +846,6 @@ class TitanEngine:
                  self.db.log_decision(symbol, 0, p.get('reason',''), "SKIP", "SHORTS_DISABLED", ai_raw=raw_text)
                  continue
 
-            # V8.7.1: PRE-FLIGHT SHORT CHECK
             if side == 'SELL':
                 try:
                     account = self.alpaca.get_account()
@@ -949,34 +962,31 @@ class TitanEngine:
                 max_capital_usd = current_equity * (CONFIG["MAX_CAPITAL_PER_TRADE_PCT"] / 100.0)
                 max_qty_by_cap = math.floor(max_capital_usd / entry)
                 
-                # Triangular Constraint: Risk vs Wallet vs Exposure
                 qty = min(raw_qty, max_affordable_qty, max_qty_by_cap)
                 
                 force_shadow = False
                 force_reason = ""
 
-                # V8.7.3b: GLOBAL EXPOSURE CAP CHECK
+                # V8.7.4: GLOBAL EXPOSURE CAP (PREVENTIVE CHECK - NO HALT)
                 new_trade_exposure = qty * entry
                 max_total_exposure = current_equity * (CONFIG["MAX_TOTAL_EXPOSURE_PCT"] / 100.0)
                 
                 if (current_exposure + new_trade_exposure) > max_total_exposure:
-                     # Calculate max qty allowed to stay under Global Cap
                      remaining_exposure = max_total_exposure - current_exposure
                      if remaining_exposure <= 0:
-                         self.db.log_decision(symbol, conf, thesis, "SKIP", f"GLOBAL_EXPOSURE_FULL ({round(current_exposure/current_equity*100,1)}%)", ai_raw=raw_text)
+                         # Change from HIT/FULL to ACTIVE/GUARD to avoid confusing audit
+                         self.db.log_decision(symbol, conf, thesis, "SKIP", f"SOLVENCY_GUARD_ACTIVE (Global Exp {round(current_exposure/current_equity*100,1)}%)", ai_raw=raw_text)
                          continue
                      
-                     # Reduce qty to fit global cap if necessary
                      qty_limit_global = math.floor(remaining_exposure / entry)
                      if qty > qty_limit_global:
                          qty = qty_limit_global
                          capped_reason += f" [GLOBAL_CAP_FIT]"
                      
                      if qty < 1:
-                          self.db.log_decision(symbol, conf, thesis, "SKIP", f"GLOBAL_EXPOSURE_CAP ({round((current_exposure)/current_equity*100,1)}%)", ai_raw=raw_text)
+                          self.db.log_decision(symbol, conf, thesis, "SKIP", f"SOLVENCY_GUARD_ACTIVE (Global Limit Reached)", ai_raw=raw_text)
                           continue
 
-                # Analyze Capping Source (V8.7.3b Enhanced Logging)
                 if qty < raw_qty:
                     if qty == max_qty_by_cap:
                         capped_reason += f" [SINGLE_CAP: {CONFIG['MAX_CAPITAL_PER_TRADE_PCT']}%]"
@@ -991,9 +1001,9 @@ class TitanEngine:
                         capped_reason += " [Micro-Pos Allowed]"
                 
                 if qty < 1 and not force_shadow:
-                    # V8.7.3b: SPECIFIC SOLVENCY LOGGING
+                    # V8.7.4: CLEAR SEMANTIC LOGGING (PASSIVE PROTECTION)
                     reason_tag = "INSUFFICIENT_FUNDS"
-                    if qty == max_qty_by_cap: reason_tag = "SKIP: SOLVENCY_CAP_HIT"
+                    if qty == max_qty_by_cap: reason_tag = "SKIP: SOLVENCY_GUARD_ACTIVE"
                     
                     debug_info = f"{reason_tag} | Price=${entry} Equity=${round(current_equity,0)}"
                     self.db.log_decision(symbol, conf, thesis, "SKIP", debug_info, ai_raw=raw_text)
@@ -1033,7 +1043,6 @@ class TitanEngine:
                     dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", log_msg, ai_raw=raw_text)
                     
                     try:
-                        # V8.7.1: STRICT BRACKET ONLY - NO 2-PHASE
                         order = self.alpaca.submit_order(
                             symbol=symbol, qty=qty, side=side.lower(), type='market', time_in_force='gtc', 
                             order_class='bracket', 
@@ -1124,7 +1133,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Institution v8.7.3b Ready. Global Exposure Cap Active.")
+    logger.info(f"Titan-Defcon v8.7.4 Ready. Clear Solvency Logs Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
