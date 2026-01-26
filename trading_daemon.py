@@ -7,14 +7,14 @@ import aiohttp
 import re
 import math
 import statistics
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone, time
 from dotenv import load_dotenv
 import alpaca_trade_api as tradeapi
 from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.6.8 (ACTIVE LEARNER) ---
+# --- CONFIGURATION V8.6.8 (ACTIVE LEARNER - HOTFIX) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,7 +22,7 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 
 CONFIG = {
-    "VERSION": "8.6.8-Active-Learner",
+    "VERSION": "8.6.8-Active-Learner-Fix",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     
@@ -35,16 +35,16 @@ CONFIG = {
     "MACRO_THRESHOLD": 85,             
     "MIN_TRADE_AMOUNT_USD": 150.0,
     
-    # --- KILL SWITCH 2-STAGES (V8.6.8) ---
+    # --- KILL SWITCH 2-STAGES ---
     "MIN_WINRATE_THRESHOLD": 62.0,     
-    "PNL_WARN_THRESHOLD": -1.5,        # Déclenche le mode DEGRADED
-    "PNL_CRIT_THRESHOLD": -3.0,        # Déclenche le HALT complet
+    "PNL_WARN_THRESHOLD": -1.5,        
+    "PNL_CRIT_THRESHOLD": -3.0,        
     "WINRATE_LOOKBACK_TRADES": 20,     
     "MARKET_OPEN_BLACKOUT_MIN": 15,    
     
-    # --- SCOUT MODE (V8.6.8) ---
-    "ALLOW_SCOUT_TRADE": True,         # Autorise 1 trade/jour sans Shadow Promotion
-    "SCOUT_RISK_FACTOR": 0.5,          # Risque réduit pour le Scout (1.0%)
+    # --- SCOUT MODE ---
+    "ALLOW_SCOUT_TRADE": True,         
+    "SCOUT_RISK_FACTOR": 0.5,          
 
     # --- SHADOW PROMOTION ---
     "SHADOW_PROMOTION_MIN_WINS": 2,    
@@ -64,7 +64,6 @@ CONFIG = {
         "MACRO": {"TP_MULT": 6.0, "SL_MULT": 4.0, "DESC": "Macro Structural", "TRAILING": False} 
     },
     
-    # BE Ajusté dynamiquement dans le code (0.35 pour RANGE, 0.5 sinon)
     "BE_TRIGGER_ATR_STD": 0.5,
     "BE_TRIGGER_ATR_RANGE": 0.35, 
     
@@ -121,7 +120,7 @@ class NotificationManager:
         elif priority == "TRADE": color = 0x2ecc71    
         elif priority == "WARNING": color = 0xf1c40f
         elif priority == "ERROR": color = 0xe67e22 
-        elif priority == "DEGRADED": color = 0x9b59b6 # Purple for degraded mode
+        elif priority == "DEGRADED": color = 0x9b59b6
 
         payload = {
             "embeds": [{
@@ -168,10 +167,7 @@ class AdaptiveManager:
         "STANDARD": {"be_trigger": 1.0, "trailing_step": CONFIG["TRAILING_STEP_ATR"], "trailing_mult_offset": 0.0, "desc": "Standard"},
         "TREND_HV": {"be_trigger": 1.5, "trailing_step": 0.8, "trailing_mult_offset": 0.5, "desc": "Trend High Vol"},
         "TREND_LV": {"be_trigger": 0.8, "trailing_step": 0.3, "trailing_mult_offset": -0.2, "desc": "Trend Low Vol"},
-        
-        # V8.6.8: Range Scalp with dynamic BE logic handled in lifecycle
         "RANGE_SCALP": {"be_trigger": CONFIG["BE_TRIGGER_ATR_RANGE"], "trailing_step": 0.0, "trailing_mult_offset": 0.0, "desc": "Retail Scalp (Optimized)"},
-        
         "MACRO": {"be_trigger": 2.5, "trailing_step": 1.0, "trailing_mult_offset": 1.0, "desc": "Macro Structural"} 
     }
     @staticmethod
@@ -195,7 +191,6 @@ class TitanDatabase:
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
-            # V8.6.8: Added lowest_price for MAE calculation
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -226,10 +221,9 @@ class TitanDatabase:
             conn.execute("CREATE TABLE IF NOT EXISTS system_state (key TEXT PRIMARY KEY, value TEXT)")
             conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('is_halted', '0')")
             conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('halt_reason', '')")
-            conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('system_health', 'HEALTHY')") # HEALTHY, DEGRADED, CRITICAL
+            conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('system_health', 'HEALTHY')")
             conn.commit()
             
-            # Migrations
             try: conn.execute("ALTER TABLE trades ADD COLUMN side TEXT DEFAULT 'BUY'")
             except sqlite3.OperationalError: pass
             try: conn.execute("ALTER TABLE trades ADD COLUMN lowest_price REAL")
@@ -237,7 +231,6 @@ class TitanDatabase:
 
     def log_trade(self, symbol, qty, price, conf, thesis, mode, tp, sl, dec_id, order_id, atr, regime, side, adaptive_code="INIT"):
         with sqlite3.connect(self.db_path) as conn:
-            # Initialize lowest_price with entry price
             conn.execute("""INSERT INTO trades 
                 (symbol, qty, entry_price, confidence, thesis, mode, tp_price, sl_price, status, decision_id, alpaca_order_id, atr_at_entry, market_regime, highest_price, lowest_price, sl_updates_count, adaptive_code, adaptive_reason, side) 
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,'Initialized',?)""",
@@ -279,7 +272,6 @@ class TitanDatabase:
             """, (symbol,)).fetchone()[0]
             return count
     
-    # V8.6.8: Count daily live trades for Scout Mode
     def get_daily_live_trade_count(self):
         with sqlite3.connect(self.db_path) as conn:
             count = conn.execute("""
@@ -430,22 +422,18 @@ class TitanEngine:
         if len(tr_list) < period: return 0.0
         return statistics.mean(tr_list[-period:])
 
-    # V8.6.8: 2-Stage Health Check
     async def check_system_health(self):
         winrate, cum_pnl, count = self.db.get_rolling_live_stats(CONFIG["WINRATE_LOOKBACK_TRADES"])
-        
         current_health = self.status["health"]
         new_health = "HEALTHY"
         
         if winrate is not None and count >= CONFIG["WINRATE_LOOKBACK_TRADES"]:
-            # Check Critical first
             if winrate < CONFIG["MIN_WINRATE_THRESHOLD"] and cum_pnl < CONFIG["PNL_CRIT_THRESHOLD"]:
                 reason = f"CRITICAL FAILURE (WR {round(winrate,1)}% / PnL {round(cum_pnl,1)}%)"
                 self.db.set_system_state(True, reason, "CRITICAL")
                 await self.notifier.send_halt(reason)
                 logger.critical(f"🛑 {reason}")
                 return False
-            # Check Degraded
             elif winrate < CONFIG["MIN_WINRATE_THRESHOLD"] and cum_pnl < CONFIG["PNL_WARN_THRESHOLD"]:
                 new_health = "DEGRADED"
                 if current_health != "DEGRADED":
@@ -453,7 +441,6 @@ class TitanEngine:
                     self.db.set_system_state(False, "", "DEGRADED")
                     await self.notifier.send_degraded(reason)
             else:
-                # Recovery to Healthy
                 if current_health != "HEALTHY":
                     self.db.set_system_state(False, "", "HEALTHY")
                     await self.notifier.send("✅ System Recovered", "Metrics back to normal.", priority="INFO")
@@ -480,11 +467,24 @@ class TitanEngine:
             clock = self.alpaca.get_clock()
             is_open = clock.is_open
             
+            # --- FIX v8.6.8: DATETIME.TIME + TIMEDELTA CRASH ---
             if is_open and self.market_open_time is None:
                 try:
                     calendar = self.alpaca.get_calendar(start=date.today().isoformat(), end=date.today().isoformat())
                     if calendar:
-                        self.market_open_time = calendar[0].open
+                        open_time_raw = calendar[0].open # Likely datetime.time
+                        today = datetime.now(timezone.utc).date()
+                        
+                        # Robust combine: make sure we have datetime.time
+                        if isinstance(open_time_raw, datetime):
+                            self.market_open_time = open_time_raw
+                        else:
+                            # It is datetime.time, combine it properly
+                            self.market_open_time = datetime.combine(today, open_time_raw)
+                            # Force UTC if naive to avoid comparison issues
+                            if self.market_open_time.tzinfo is None:
+                                self.market_open_time = self.market_open_time.replace(tzinfo=timezone.utc)
+                                
                         logger.info(f"🕒 Market Open Time Cached: {self.market_open_time}")
                 except Exception as e: logger.warning(f"Failed to cache market open: {e}")
             elif not is_open:
@@ -547,11 +547,10 @@ class TitanEngine:
         
         profile = AdaptiveManager.get_profile(profile_code)
         
-        # V8.6.8: Differentiated BE for RANGE
         if profile_code == "RANGE_SCALP":
-            be_trigger = CONFIG["BE_TRIGGER_ATR_RANGE"] # 0.35
+            be_trigger = CONFIG["BE_TRIGGER_ATR_RANGE"]
         else:
-            be_trigger = profile["be_trigger"] # 0.5 (Standard) or others
+            be_trigger = profile["be_trigger"]
             
         trailing_step = profile["trailing_step"]
         trailing_offset_mult = profile["trailing_mult_offset"]
@@ -563,8 +562,6 @@ class TitanEngine:
         update_needed = False
         is_be = bool(t['is_be_active'])
         
-        # V8.6.8: Update Highest/Lowest for MFE/MAE
-        # Handle None in DB (for old trades)
         highest = t['highest_price'] if t['highest_price'] is not None else entry
         lowest = t['lowest_price'] if t['lowest_price'] is not None else entry
         
@@ -609,7 +606,6 @@ class TitanEngine:
             
             if update_needed and new_sl >= current_sl: update_needed = False
 
-        # Apply Updates (SL or Stats)
         success = False
         if update_needed:
             if t['mode'] == 'LIVE':
@@ -625,14 +621,8 @@ class TitanEngine:
                 except Exception as e: logger.error(f"❌ API ERROR updating {t['symbol']}: {e}")
             else: success = True
         
-        # Always update stats (High/Low/MAE/MFE) even if no SL change
         code_to_save = profile_code if save_profile else None
         reason_to_save = adaptive_desc if save_profile else None
-        
-        # If no SL update needed, we still want to save stats occasionally? 
-        # For simplicity in this logic, we call update_trade_stats every lifecycle tick if price changed bound
-        # But to avoid DB spam, we combine it with SL updates OR checking if bounds changed significantly.
-        # Here we just update if bounds changed OR sl changed.
         bounds_changed = (highest != t['highest_price']) or (lowest != t['lowest_price'])
         
         if success or bounds_changed:
@@ -698,7 +688,6 @@ class TitanEngine:
 
                     if not is_closed:
                         regime = t['market_regime'] if 'market_regime' in t.keys() else "RANGE"
-                        # Handle old trades without adaptive code
                         ac = t['adaptive_code'] if t['adaptive_code'] else 'INIT'
                         if ac == 'MACRO': cfg = CONFIG["REGIME_CONFIG"]["MACRO"]
                         else: cfg = CONFIG["REGIME_CONFIG"].get(regime, CONFIG["REGIME_CONFIG"]["RANGE"])
@@ -745,8 +734,10 @@ class TitanEngine:
                 self.status["safety"]["market_stress"] = spy_vol > CONFIG["MARKET_STRESS_THRESHOLD"]
         except Exception: pass
         
+        # --- FIX v8.6.8: DATETIME SAFE COMPARISON ---
         if self.market_open_time:
              now = datetime.now(timezone.utc)
+             # now is UTC aware. market_open_time is UTC aware thanks to fix.
              if now < (self.market_open_time + timedelta(minutes=CONFIG["MARKET_OPEN_BLACKOUT_MIN"])):
                  self.db.log_decision("SYSTEM", 0, "Market Open Blackout (First 15m)", "IDLE", "")
                  return 
@@ -770,7 +761,6 @@ class TitanEngine:
             if trade_risk > 0: current_open_risk += trade_risk
             if t['adaptive_code'] == 'MACRO': current_macro_count += 1
         
-        # V8.6.8: Scout Trade Check
         daily_live_count = self.db.get_daily_live_trade_count()
         is_scout_mode_eligible = CONFIG["ALLOW_SCOUT_TRADE"] and (daily_live_count == 0) and (len(current_open_trades) == 0)
 
@@ -816,12 +806,11 @@ class TitanEngine:
                 is_shadow_promoted = (shadow_wins >= CONFIG["SHADOW_PROMOTION_MIN_WINS"]) or \
                                      (shadow_wins >= 1 and shadow_max_conf >= CONFIG["SHADOW_PROMOTION_HIGH_CONF"])
                 
-                # V8.6.8: Scout Trade Override
                 is_scout_trade = False
                 if is_scout_mode_eligible and not is_shadow_promoted and not is_macro_mode:
-                    if conf > 78: # Good enough for a scout
+                    if conf > 78: 
                          is_scout_trade = True
-                         is_scout_mode_eligible = False # One scout per day logic consumed
+                         is_scout_mode_eligible = False 
                 
                 if conf >= CONFIG["MACRO_THRESHOLD"] or is_shadow_promoted:
                     is_macro_mode = True
@@ -860,10 +849,9 @@ class TitanEngine:
                 current_equity = self.status["equity"]["current"]
                 if current_equity <= 0: current_equity = 1000.0
                 
-                # V8.6.8: Risk Adjustment (Scout or Degraded)
                 base_risk_pct = CONFIG["RISK_PCT_PER_TRADE"]
                 if self.status["health"] == "DEGRADED":
-                    base_risk_pct *= 0.5 # Half risk in degraded mode
+                    base_risk_pct *= 0.5 
                     capped_reason += " [DEGRADED_MODE]"
                 elif is_scout_trade:
                     base_risk_pct *= CONFIG["SCOUT_RISK_FACTOR"]
@@ -908,7 +896,6 @@ class TitanEngine:
                     force_shadow = True
                     force_reason = "MACRO_SLOT_FULL (Sniper Mode)"
                     
-                # V8.6.8: Degraded Mode Cap
                 if self.status["health"] == "DEGRADED" and (len(current_open_trades) >= 1):
                     force_shadow = True
                     force_reason = "DEGRADED_MODE_CAP (Max 1 Pos)"
@@ -1018,7 +1005,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Active-Learner v8.6.8 Ready. Scout Mode & MAE/MFE Tracking Active.")
+    logger.info(f"Titan-Active-Learner v8.6.8 (HOTFIX) Ready. Scout Mode & MAE/MFE Tracking Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
