@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.6.9 (NVDA UNLOCKED) ---
+# --- CONFIGURATION V8.7.0 (PRO EXECUTION) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,7 +22,7 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 
 CONFIG = {
-    "VERSION": "8.6.9-NVDA-Unlocked",
+    "VERSION": "8.7.0-Pro-Execution",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     
@@ -34,6 +34,7 @@ CONFIG = {
     "LIVE_THRESHOLD": 76,
     "MACRO_THRESHOLD": 85,             
     "MIN_TRADE_AMOUNT_USD": 150.0,
+    "TWO_PHASE_ENTRY_THRESHOLD": 100.0, # Trigger for 2-Phase Entry
     
     # --- KILL SWITCH 2-STAGES ---
     "MIN_WINRATE_THRESHOLD": 62.0,     
@@ -79,16 +80,16 @@ CONFIG = {
     "NOTIFY_LEVEL": "INFO",
     "MIN_SL_DISTANCE_USD": 0.05,
     "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
-    "AI_MODEL": "openai/gpt-5.2-chat",
+    "AI_MODEL": "deepseek/deepseek-v3.2",
     "SCAN_INTERVAL": 60 
 }
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_6_9.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_7_0.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-NVDA")
+logger = logging.getLogger("Titan-Pro")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -137,10 +138,10 @@ class NotificationManager:
                 if resp.status >= 400: logger.error(f"Webhook failed: {resp.status}")
         except Exception as e: logger.error(f"Notification error: {e}")
 
-    async def send_trade_entry(self, symbol, side, qty, price, thesis, regime, scout=False):
+    async def send_trade_entry(self, symbol, side, qty, price, thesis, regime, scout=False, execution_mode="BRACKET"):
         emoji = "🔭" if scout else ("📈" if side == "BUY" else "📉")
         title_sfx = " [SCOUT]" if scout else ""
-        msg = f"**Symbol:** {symbol}\n**Side:** {side}\n**Qty:** {qty}\n**Price:** ${price}\n**Regime:** {regime}\n**Thesis:** {thesis}"
+        msg = f"**Symbol:** {symbol}\n**Side:** {side}\n**Qty:** {qty}\n**Price:** ${price}\n**Regime:** {regime}\n**Mode:** {execution_mode}\n**Thesis:** {thesis}"
         await self.send(f"{emoji} Trade Entry{title_sfx}: {symbol}", msg, priority="TRADE")
 
     async def send_trade_exit(self, symbol, result, entry, exit_price, pnl_pct):
@@ -183,7 +184,7 @@ class AdaptiveManager:
         elif regime == "RANGE": return "RANGE_SCALP"
         return "STANDARD"
 
-# --- PERSISTANCE (V8.6.9) ---
+# --- PERSISTANCE (V8.7.0) ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
@@ -467,24 +468,18 @@ class TitanEngine:
             clock = self.alpaca.get_clock()
             is_open = clock.is_open
             
-            # --- FIX v8.6.8: DATETIME.TIME + TIMEDELTA CRASH ---
             if is_open and self.market_open_time is None:
                 try:
                     calendar = self.alpaca.get_calendar(start=date.today().isoformat(), end=date.today().isoformat())
                     if calendar:
-                        open_time_raw = calendar[0].open # Likely datetime.time
+                        open_time_raw = calendar[0].open 
                         today = datetime.now(timezone.utc).date()
-                        
-                        # Robust combine: make sure we have datetime.time
                         if isinstance(open_time_raw, datetime):
                             self.market_open_time = open_time_raw
                         else:
-                            # It is datetime.time, combine it properly
                             self.market_open_time = datetime.combine(today, open_time_raw)
-                            # Force UTC if naive to avoid comparison issues
                             if self.market_open_time.tzinfo is None:
                                 self.market_open_time = self.market_open_time.replace(tzinfo=timezone.utc)
-                                
                         logger.info(f"🕒 Market Open Time Cached: {self.market_open_time}")
                 except Exception as e: logger.warning(f"Failed to cache market open: {e}")
             elif not is_open:
@@ -734,10 +729,8 @@ class TitanEngine:
                 self.status["safety"]["market_stress"] = spy_vol > CONFIG["MARKET_STRESS_THRESHOLD"]
         except Exception: pass
         
-        # --- FIX v8.6.8: DATETIME SAFE COMPARISON ---
         if self.market_open_time:
              now = datetime.now(timezone.utc)
-             # now is UTC aware. market_open_time is UTC aware thanks to fix.
              if now < (self.market_open_time + timedelta(minutes=CONFIG["MARKET_OPEN_BLACKOUT_MIN"])):
                  self.db.log_decision("SYSTEM", 0, "Market Open Blackout (First 15m)", "IDLE", "")
                  return 
@@ -792,7 +785,13 @@ class TitanEngine:
                     self.db.log_decision(symbol, conf, thesis, "SKIP", "NO_DATA", ai_raw=raw_text)
                     continue
 
-                entry = bars[-1].c
+                entry_candle = bars[-1].c
+                try:
+                    latest = self.alpaca.get_latest_trade(symbol)
+                    entry = float(latest.price)
+                except Exception as e:
+                    entry = entry_candle
+                
                 atr = self.calculate_atr(bars, period=CONFIG["ATR_PERIOD"])
                 regime = self.analyze_market_regime(bars)
 
@@ -826,7 +825,6 @@ class TitanEngine:
                 sl_dist = atr * sl_mult
                 tp_dist = atr * tp_mult
 
-                # --- FIX v8.6.9: ROBUST TICK SIZE CLAMPING ---
                 MIN_TICK = 0.01
                 
                 if side == "BUY":
@@ -838,7 +836,6 @@ class TitanEngine:
                     sl = max(round(entry + sl_dist, 2), round(entry + MIN_TICK, 2))
                     sl_dist = round(sl - entry, 2)
 
-                # Pre-flight check for validity (Extra safety)
                 if side == "BUY" and (tp <= entry or sl >= entry):
                         self.db.log_decision(symbol, conf, thesis, "SKIP", f"MATH_ERROR (TP={tp} SL={sl} Entry={entry})", ai_raw=raw_text)
                         continue
@@ -925,11 +922,68 @@ class TitanEngine:
                     dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", log_msg, ai_raw=raw_text)
                     
                     try:
-                        order = self.alpaca.submit_order(
-                            symbol=symbol, qty=qty, side=side.lower(), type='market', time_in_force='gtc', 
-                            order_class='bracket', 
-                            take_profit={'limit_price': tp}, stop_loss={'stop_price': sl}
-                        )
+                        # V8.7.0: TWO-PHASE ENTRY FOR HIGH PRICED SYMBOLS
+                        use_2_phase = entry > CONFIG["TWO_PHASE_ENTRY_THRESHOLD"]
+                        
+                        if use_2_phase:
+                            # Phase 1: Pure Market Entry
+                            entry_order = self.alpaca.submit_order(
+                                symbol=symbol, qty=qty, side=side.lower(), type='market', time_in_force='gtc'
+                            )
+                            logger.info(f"PHASE 1 (Market) Sent: {symbol}")
+                            
+                            # Phase 2: Wait for Fill
+                            filled_order = None
+                            wait_attempts = 0
+                            while wait_attempts < 20: # 10 seconds timeout
+                                await asyncio.sleep(0.5)
+                                try:
+                                    o = self.alpaca.get_order(entry_order.id)
+                                    if o.status == 'filled':
+                                        filled_order = o
+                                        break
+                                    if o.status in ['canceled', 'rejected', 'expired']:
+                                        break
+                                except: pass
+                                wait_attempts += 1
+                            
+                            if not filled_order:
+                                logger.error(f"❌ Phase 2 Fail: Timeout/Reject on {symbol}")
+                                self.alpaca.cancel_order(entry_order.id)
+                                continue
+
+                            # Phase 3: Calc & OCO Exit
+                            fill_price = float(filled_order.filled_avg_price)
+                            
+                            if side == "BUY":
+                                real_tp = max(round(fill_price + tp_dist, 2), round(fill_price + 0.02, 2))
+                                real_sl = min(round(fill_price - sl_dist, 2), round(fill_price - 0.02, 2))
+                                exit_side = "sell"
+                            else:
+                                real_tp = min(round(fill_price - tp_dist, 2), round(fill_price - 0.02, 2))
+                                real_sl = max(round(fill_price + sl_dist, 2), round(fill_price + 0.02, 2))
+                                exit_side = "buy"
+
+                            self.alpaca.submit_order(
+                                symbol=symbol, qty=qty, side=exit_side, 
+                                type='limit', limit_price=real_tp, 
+                                order_class='oco', 
+                                stop_loss={'stop_price': real_sl},
+                                time_in_force='gtc'
+                            )
+                            order = entry_order # For logging consistency
+                            tp, sl, entry = real_tp, real_sl, fill_price # Update vars for DB log
+                            execution_mode = "2-PHASE-OCO"
+
+                        else:
+                            # Standard Bracket Entry
+                            order = self.alpaca.submit_order(
+                                symbol=symbol, qty=qty, side=side.lower(), type='market', time_in_force='gtc', 
+                                order_class='bracket', 
+                                take_profit={'limit_price': tp}, stop_loss={'stop_price': sl}
+                            )
+                            execution_mode = "BRACKET"
+
                     except APIError as e:
                         self.db.log_decision(symbol, conf, thesis, "LIVE_API_ERROR", str(e), ai_raw=raw_text)
                         await self.notifier.send_rejection(symbol, "API_ERROR", str(e))
@@ -950,8 +1004,8 @@ class TitanEngine:
                     adaptive_tag = "MACRO" if is_macro_mode else "INIT"
                     self.db.log_trade(symbol, qty, entry, conf, thesis, "LIVE", tp, sl, dec_id, order.id, atr, regime, side, adaptive_tag)
                     
-                    logger.info(f"LIVE [{mode_tag}]: {symbol} {side} Qty:{qty} TP:{tp} SL:{sl} {capped_reason}")
-                    await self.notifier.send_trade_entry(symbol, side, qty, entry, thesis, mode_tag, scout=is_scout_trade)
+                    logger.info(f"LIVE [{mode_tag}] ({execution_mode}): {symbol} {side} Qty:{qty} TP:{tp} SL:{sl} {capped_reason}")
+                    await self.notifier.send_trade_entry(symbol, side, qty, entry, thesis, mode_tag, scout=is_scout_trade, execution_mode=execution_mode)
                 else:
                     rej = "STRESS" if self.status["safety"]["market_stress"] else "CONF/LIMIT"
                     if force_shadow: rej = force_reason 
@@ -1012,7 +1066,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-NVDA-Unlocked v8.6.9 Ready. Robust Clamping Active.")
+    logger.info(f"Titan-Pro v8.7.0 Ready. Two-Phase Execution Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
