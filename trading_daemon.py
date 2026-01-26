@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.6.8 (ACTIVE LEARNER - HOTFIX) ---
+# --- CONFIGURATION V8.6.9 (NVDA UNLOCKED) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,7 +22,7 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 
 CONFIG = {
-    "VERSION": "8.6.8-Active-Learner-Fix",
+    "VERSION": "8.6.9-NVDA-Unlocked",
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     
@@ -79,16 +79,16 @@ CONFIG = {
     "NOTIFY_LEVEL": "INFO",
     "MIN_SL_DISTANCE_USD": 0.05,
     "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
-    "AI_MODEL": "deepseek/deepseek-v3.2",
+    "AI_MODEL": "openai/gpt-5.2-chat",
     "SCAN_INTERVAL": 60 
 }
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_6_8.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_6_9.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-Learner")
+logger = logging.getLogger("Titan-NVDA")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -183,7 +183,7 @@ class AdaptiveManager:
         elif regime == "RANGE": return "RANGE_SCALP"
         return "STANDARD"
 
-# --- PERSISTANCE (V8.6.8) ---
+# --- PERSISTANCE (V8.6.9) ---
 class TitanDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
@@ -826,18 +826,25 @@ class TitanEngine:
                 sl_dist = atr * sl_mult
                 tp_dist = atr * tp_mult
 
+                # --- FIX v8.6.9: ROBUST TICK SIZE CLAMPING ---
+                MIN_TICK = 0.01
+                
                 if side == "BUY":
-                    tp = round(entry + tp_dist, 2)
-                    sl = round(entry - sl_dist, 2)
-                    if tp <= entry: tp = round(entry + 0.01, 2)
-                    if sl >= entry: sl = round(entry - 0.01, 2)
+                    tp = max(round(entry + tp_dist, 2), round(entry + MIN_TICK, 2))
+                    sl = min(round(entry - sl_dist, 2), round(entry - MIN_TICK, 2))
                     sl_dist = round(entry - sl, 2)
                 else: # SELL
-                    tp = round(entry - tp_dist, 2)
-                    sl = round(entry + sl_dist, 2)
-                    if tp >= entry: tp = round(entry - 0.01, 2)
-                    if sl <= entry: sl = round(entry + 0.01, 2)
+                    tp = min(round(entry - tp_dist, 2), round(entry - MIN_TICK, 2))
+                    sl = max(round(entry + sl_dist, 2), round(entry + MIN_TICK, 2))
                     sl_dist = round(sl - entry, 2)
+
+                # Pre-flight check for validity (Extra safety)
+                if side == "BUY" and (tp <= entry or sl >= entry):
+                        self.db.log_decision(symbol, conf, thesis, "SKIP", f"MATH_ERROR (TP={tp} SL={sl} Entry={entry})", ai_raw=raw_text)
+                        continue
+                if side == "SELL" and (tp >= entry or sl <= entry):
+                        self.db.log_decision(symbol, conf, thesis, "SKIP", f"MATH_ERROR (TP={tp} SL={sl} Entry={entry})", ai_raw=raw_text)
+                        continue
                 
                 if not is_macro_mode:
                     if sl_dist < CONFIG["MIN_SL_DISTANCE_USD"]:
@@ -1005,7 +1012,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Active-Learner v8.6.8 (HOTFIX) Ready. Scout Mode & MAE/MFE Tracking Active.")
+    logger.info(f"Titan-NVDA-Unlocked v8.6.9 Ready. Robust Clamping Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
