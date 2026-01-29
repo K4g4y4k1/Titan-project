@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.8.2 (RETAIL FIX) ---
+# --- CONFIGURATION V8.8.3 (RETAIL SURVIVAL) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,7 +22,7 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 
 CONFIG = {
-    "VERSION": "8.8.2-Retail-Fix",
+    "VERSION": "8.8.3-Retail-Survival",
     "LEARNING_EPOCH": 1,               
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
@@ -49,6 +49,10 @@ CONFIG = {
     "WINRATE_LOOKBACK_TRADES": 20,     
     "MARKET_OPEN_BLACKOUT_MIN": 15,    
     
+    # --- PDT GUARD (NEW v8.8.3) ---
+    "PDT_MAX_TRADES": 3,               # Max day trades allowed in 5 rolling days
+    "FORCE_SHADOW_AT_PDT_LIMIT": True, # Switch to SHADOW if PDT limit reached
+    
     # --- SCOUT MODE ---
     "ALLOW_SCOUT_TRADE": True,         
     "SCOUT_RISK_FACTOR": 0.5,          
@@ -62,8 +66,7 @@ CONFIG = {
     "COOLDOWN_PER_SYMBOL_MIN": 15,
     "ATR_PERIOD": 14,
     
-    # FIX #1: DISABLE SHORTS (Retail Account Restriction)
-    "ALLOW_SHORTS": False,
+    "ALLOW_SHORTS": False, # Still disabled for Retail
     
     # --- CALIBRATION REGIMES ---
     "REGIME_CONFIG": {
@@ -89,16 +92,15 @@ CONFIG = {
     "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
     "AI_MODEL": "deepseek/deepseek-v3.2",
     
-    # FIX #3: SLOW DOWN SCANNING (PDT Management)
     "SCAN_INTERVAL": 300 
 }
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_8_2.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_8_3.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-RetailFix")
+logger = logging.getLogger("Titan-RetailSurvival")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -112,6 +114,10 @@ def clean_deepseek_json(raw_text: str):
         return json.loads(match.group(0))
     except json.JSONDecodeError:
         return None
+
+def sanitize_price(price):
+    """Force 2 decimal precision for API compliance."""
+    return float(f"{price:.2f}")
 
 # --- NOTIFICATION MANAGER ---
 class NotificationManager:
@@ -159,8 +165,8 @@ class NotificationManager:
         msg = f"**Result:** {result}\n**Entry:** ${entry}\n**Exit:** ${exit_price}\n**Move:** {pnl_pct}%{stats}"
         await self.send(f"{emoji} Trade Closed: {symbol}", msg, priority="TRADE")
 
-    async def send_heartbeat(self, status, equity, pnl_day, spy_vol, buying_power):
-        msg = f"**State:** {status}\n**Equity:** ${equity}\n**Buying Power:** ${buying_power}\n**Day PnL:** {pnl_day}%\n**SPY Vol:** {spy_vol}%"
+    async def send_heartbeat(self, status, equity, pnl_day, spy_vol, buying_power, pdt_count):
+        msg = f"**State:** {status}\n**Equity:** ${equity}\n**Day PnL:** {pnl_day}%\n**PDT Count:** {pdt_count}/5\n**SPY Vol:** {spy_vol}%"
         await self.send("💓 System Heartbeat", msg, priority="INFO")
 
     async def send_halt(self, reason):
@@ -394,6 +400,7 @@ class TitanEngine:
         self.last_heartbeat = datetime.min
         self.was_market_open = False
         self.market_open_time = None 
+        self.pdt_count = 0 # Cached PDT count
         
         is_halted, reason, health = self.db.get_system_state()
         self.status = {
@@ -505,6 +512,7 @@ class TitanEngine:
     async def sync_data(self):
         try:
             acc = self.alpaca.get_account()
+            self.pdt_count = int(acc.daytrade_count) # Cache PDT
             eq = float(acc.equity)
             bp = float(acc.buying_power)
             start_eq = self.db.get_or_create_daily_stats(eq)
@@ -574,7 +582,7 @@ class TitanEngine:
 
             if datetime.now() - self.last_heartbeat > timedelta(minutes=CONFIG["HEARTBEAT_INTERVAL_MIN"]):
                 spy_vol = 0.0 
-                await self.notifier.send_heartbeat(f"{self.status['state']} [{self.status['health']}]", round(eq, 2), round(pnl_pct, 2), "N/A", round(bp, 2))
+                await self.notifier.send_heartbeat(f"{self.status['state']} [{self.status['health']}]", round(eq, 2), round(pnl_pct, 2), "N/A", round(bp, 2), self.pdt_count)
                 self.last_heartbeat = datetime.now()
 
         except Exception as e: logger.error(f"Sync error: {e}")
@@ -741,7 +749,6 @@ class TitanEngine:
                         move_pct = round((t['entry_price'] - exit_price) / t['entry_price'] * 100, 2)
                         final_mae = min(final_mae, (t['entry_price'] - exit_price)/t['entry_price']*100)
 
-                    # PATCH #5: MFE Analysis Post-Mortem
                     if res == 'SL' and final_mfe > 0.25:
                         logger.warning(f"⚠️ GOOD IDEA, BAD EXIT: {symbol} MFE={round(final_mfe,2)}%")
 
@@ -849,24 +856,31 @@ class TitanEngine:
         daily_live_count = self.db.get_daily_live_trade_count()
         is_scout_mode_eligible = CONFIG["ALLOW_SCOUT_TRADE"] and (daily_live_count == 0) and (len(current_open_trades) == 0)
 
+        # FIX #1 (v8.8.3): PDT GUARD
+        pdt_limit_reached = False
+        if CONFIG["FORCE_SHADOW_AT_PDT_LIMIT"] and self.pdt_count >= CONFIG["PDT_MAX_TRADES"]:
+            pdt_limit_reached = True
+
         for p in picks:
             capped_reason = ""
             symbol = p.get('symbol', '').upper()
             side = p.get('side', 'BUY').upper()
             if side not in ['BUY', 'SELL']: side = 'BUY'
             
-            # FIX #1: Logic check for ALLOW_SHORTS
-            if side == 'SELL' and not CONFIG["ALLOW_SHORTS"]:
-                 self.db.log_decision(symbol, 0, p.get('reason',''), "SKIP", "SHORTS_DISABLED_CFG", ai_raw=raw_text)
-                 continue
-
-            if side == 'SELL':
+            # FIX #2: Explicit SKIP for Shorts/PDT/Broker Limitations (Alpha Lost)
+            skip_tag = ""
+            if side == 'SELL' and not CONFIG["ALLOW_SHORTS"]: skip_tag = "SKIP (ALPHA_LOST_SHORT)"
+            
+            # Broker Check
+            if not skip_tag and side == 'SELL':
                 try:
                     account = self.alpaca.get_account()
-                    if not account.shorting_enabled:
-                         self.db.log_decision(symbol, 0, p.get('reason',''), "SKIP", "BROKER_RESTRICTION (Shorting Disabled)", ai_raw=raw_text)
-                         continue
+                    if not account.shorting_enabled: skip_tag = "SKIP (ALPHA_LOST_BROKER)"
                 except: pass
+            
+            if skip_tag:
+                 self.db.log_decision(symbol, 0, p.get('reason',''), "SKIP", skip_tag, ai_raw=raw_text)
+                 continue
 
             conf, thesis = p.get('confidence', 0), p.get('reason', 'N/A')
             if not symbol: continue
@@ -946,7 +960,6 @@ class TitanEngine:
                 
                 if not is_macro_mode:
                     if sl_dist < CONFIG["MIN_SL_DISTANCE_USD"]:
-                        # PATCH #1: SL Floor for Range/Live
                         if regime == "RANGE" and conf >= CONFIG["LIVE_THRESHOLD"]:
                              sl_dist = CONFIG["MIN_SL_DISTANCE_USD"]
                              if side == "BUY": sl = round(entry - sl_dist, 2)
@@ -987,7 +1000,15 @@ class TitanEngine:
                 force_shadow = False
                 force_reason = ""
 
-                # PATCH #4: Micro-Edge Filter
+                # PDT Override
+                if pdt_limit_reached and not force_shadow:
+                    force_shadow = True
+                    force_reason = "PDT_RISK_LIMIT (Max Trades Reached)"
+                    # Log as Alpha Lost
+                    if conf >= CONFIG["LIVE_THRESHOLD"]:
+                        self.db.log_decision(symbol, conf, thesis, "SKIP", "SKIP (ALPHA_LOST_PDT)", ai_raw=raw_text)
+                        continue
+
                 potential_gain_usd = qty * tp_dist
                 if potential_gain_usd < 0.20 and not force_shadow:
                     force_shadow = True
@@ -1027,7 +1048,6 @@ class TitanEngine:
                 if qty < 1 and not force_shadow:
                     reason_tag = "INSUFFICIENT_FUNDS"
                     if qty == max_qty_by_cap: reason_tag = "SKIP: SOLVENCY_GUARD_ACTIVE"
-                    
                     debug_info = f"{reason_tag} | Price=${entry} Equity=${round(current_equity,0)}"
                     self.db.log_decision(symbol, conf, thesis, "SKIP", debug_info, ai_raw=raw_text)
                     continue
@@ -1066,9 +1086,13 @@ class TitanEngine:
                     dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", log_msg, ai_raw=raw_text)
                     
                     try:
-                        # FIX #2: OCO Precision Fix (Hard Rounding)
-                        clean_tp = round(tp, 2)
-                        clean_sl = round(sl, 2)
+                        # FIX #3: Strict Sanitization
+                        clean_tp = sanitize_price(tp)
+                        clean_sl = sanitize_price(sl)
+                        
+                        # Extra Safety Check for OCO validity
+                        if side == "BUY" and (clean_tp <= entry or clean_sl >= entry):
+                            raise APIError("Sanity Check Failed: Buy params invalid (TP<=Entry or SL>=Entry)")
                         
                         order = self.alpaca.submit_order(
                             symbol=symbol, qty=qty, side=side.lower(), type='market', time_in_force='gtc', 
@@ -1086,7 +1110,6 @@ class TitanEngine:
                          await self.notifier.send_rejection(symbol, order.status, "Immediate Rejection Post-Submit")
                          continue
                     
-                    # --- SENTINEL POST-FLIGHT CHECK ---
                     asyncio.create_task(self.verify_safety_protocol(symbol))
 
                     estimated_cost = qty * entry
@@ -1160,7 +1183,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-RetailFix v8.8.2 Ready. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
+    logger.info(f"Titan-RetailSurvival v8.8.3 Ready. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
