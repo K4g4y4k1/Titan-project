@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.8.4 (PAPER UNCHAINED) ---
+# --- CONFIGURATION V8.8.5 (PAPER GOD MODE) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -22,13 +22,10 @@ OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
 ENV_MODE = os.getenv('ENV_MODE', 'PAPER')
 
-# LOGIC: DYNAMIC CONFIG BASED ON ENVIRONMENT
-# In PAPER: We remove chains to test mechanics and alpha.
-# In LIVE: We apply strict regulatory chains (PDT, Shorts restricted if cash acc, etc.)
 IS_PAPER = (ENV_MODE == 'PAPER')
 
 CONFIG = {
-    "VERSION": "8.8.4-Paper-Unchained",
+    "VERSION": "8.8.5-Paper-GodMode",
     "LEARNING_EPOCH": 1,               
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
@@ -48,7 +45,7 @@ CONFIG = {
     "LIVE_THRESHOLD": 76,
     "MACRO_THRESHOLD": 85,             
     
-    # UNCHAINED: Lower thresholds to allow execution flow in small acct
+    # GOD MODE: Low thresholds for maximum activity
     "MIN_TRADE_AMOUNT_USD": 50.0 if IS_PAPER else 150.0,
     "MICRO_EDGE_MIN_USD": 0.05 if IS_PAPER else 0.20,
     "MIN_SL_DISTANCE_USD": 0.05,        
@@ -60,9 +57,8 @@ CONFIG = {
     "WINRATE_LOOKBACK_TRADES": 20,     
     "MARKET_OPEN_BLACKOUT_MIN": 15,    
     
-    # --- PDT GUARD (Conditional) ---
+    # --- PDT GUARD ---
     "PDT_MAX_TRADES": 3,
-    # UNCHAINED: Ignore PDT in Paper
     "FORCE_SHADOW_AT_PDT_LIMIT": False if IS_PAPER else True, 
     
     # --- SCOUT MODE ---
@@ -78,7 +74,7 @@ CONFIG = {
     "COOLDOWN_PER_SYMBOL_MIN": 15,
     "ATR_PERIOD": 14,
     
-    # UNCHAINED: Allow shorts in Paper to test symmetry
+    # GOD MODE: Shorts enabled
     "ALLOW_SHORTS": True if IS_PAPER else False, 
     
     # --- CALIBRATION REGIMES ---
@@ -103,15 +99,16 @@ CONFIG = {
     "HEARTBEAT_INTERVAL_MIN": 60,
     "NOTIFY_LEVEL": "INFO",
     
-    "SCAN_INTERVAL": 300 
+    # GOD MODE: Fast Scan
+    "SCAN_INTERVAL": 60 if IS_PAPER else 300
 }
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_8_4.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_8_5.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-Unchained")
+logger = logging.getLogger("Titan-GodMode")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -127,7 +124,6 @@ def clean_deepseek_json(raw_text: str):
         return None
 
 def sanitize_price(price):
-    """Force 2 decimal precision for API compliance."""
     return float(f"{price:.2f}")
 
 # --- NOTIFICATION MANAGER ---
@@ -177,7 +173,7 @@ class NotificationManager:
         await self.send(f"{emoji} Trade Closed: {symbol}", msg, priority="TRADE")
 
     async def send_heartbeat(self, status, equity, pnl_day, spy_vol, buying_power, pdt_count):
-        msg = f"**State:** {status}\n**Equity:** ${equity}\n**Day PnL:** {pnl_day}%\n**PDT Count:** {pdt_count}/5\n**SPY Vol:** {spy_vol}%"
+        msg = f"**State:** {status}\n**Equity:** ${equity}\n**Day PnL:** {pnl_day}%\n**PDT Count:** {pdt_count} (Paper Mock)\n**SPY Vol:** {spy_vol}%"
         await self.send("💓 System Heartbeat", msg, priority="INFO")
 
     async def send_halt(self, reason):
@@ -411,7 +407,7 @@ class TitanEngine:
         self.last_heartbeat = datetime.min
         self.was_market_open = False
         self.market_open_time = None 
-        self.pdt_count = 0 # Cached PDT count
+        self.pdt_count = 0 
         
         is_halted, reason, health = self.db.get_system_state()
         self.status = {
@@ -523,7 +519,13 @@ class TitanEngine:
     async def sync_data(self):
         try:
             acc = self.alpaca.get_account()
-            self.pdt_count = int(acc.daytrade_count) # Cache PDT
+            
+            # --- GOD MODE FIX: OBLITERATE PDT IN PAPER ---
+            if IS_PAPER:
+                self.pdt_count = 0 # Force 0 to kill all downstream guards
+            else:
+                self.pdt_count = int(acc.daytrade_count)
+
             eq = float(acc.equity)
             bp = float(acc.buying_power)
             start_eq = self.db.get_or_create_daily_stats(eq)
@@ -878,12 +880,12 @@ class TitanEngine:
             side = p.get('side', 'BUY').upper()
             if side not in ['BUY', 'SELL']: side = 'BUY'
             
-            # UNCHAINED: ALLOW_SHORTS uses Config
+            # GOD MODE FIX: OBLITERATE SHORT RESTRICTIONS IN PAPER
             skip_tag = ""
             if side == 'SELL' and not CONFIG["ALLOW_SHORTS"]: skip_tag = "SKIP (ALPHA_LOST_SHORT)"
             
-            # Broker Check
-            if not skip_tag and side == 'SELL':
+            # Broker Check Bypass in Paper
+            if not skip_tag and side == 'SELL' and not IS_PAPER:
                 try:
                     account = self.alpaca.get_account()
                     if not account.shorting_enabled: skip_tag = "SKIP (ALPHA_LOST_BROKER)"
@@ -1148,6 +1150,9 @@ class TitanEngine:
                 logger.error(f"Trade error {symbol}: {e}")
 
     async def main_loop(self):
+        if IS_PAPER:
+            logger.warning("⚔️ PAPER GOD MODE ACTIVATED: PDT & Shorting Restrictions removed.")
+        
         while True:
             try:
                 await self.sync_data()
@@ -1195,7 +1200,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Unchained v8.8.4 Ready. Paper Mode Unlocked. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
+    logger.info(f"Titan-GodMode v8.8.5 Ready. Paper Mode Unlocked. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
