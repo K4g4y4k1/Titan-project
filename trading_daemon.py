@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.8.5 (PAPER GOD MODE) ---
+# --- CONFIGURATION V8.8.6 (NO LIMITS) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -25,7 +25,7 @@ ENV_MODE = os.getenv('ENV_MODE', 'PAPER')
 IS_PAPER = (ENV_MODE == 'PAPER')
 
 CONFIG = {
-    "VERSION": "8.8.5-Paper-GodMode",
+    "VERSION": "8.8.6-NoLimits",
     "LEARNING_EPOCH": 1,               
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
@@ -45,7 +45,7 @@ CONFIG = {
     "LIVE_THRESHOLD": 76,
     "MACRO_THRESHOLD": 85,             
     
-    # GOD MODE: Low thresholds for maximum activity
+    # NO LIMITS: Low thresholds for maximum activity
     "MIN_TRADE_AMOUNT_USD": 50.0 if IS_PAPER else 150.0,
     "MICRO_EDGE_MIN_USD": 0.05 if IS_PAPER else 0.20,
     "MIN_SL_DISTANCE_USD": 0.05,        
@@ -57,9 +57,9 @@ CONFIG = {
     "WINRATE_LOOKBACK_TRADES": 20,     
     "MARKET_OPEN_BLACKOUT_MIN": 15,    
     
-    # --- PDT GUARD ---
-    "PDT_MAX_TRADES": 3,
-    "FORCE_SHADOW_AT_PDT_LIMIT": False if IS_PAPER else True, 
+    # --- PDT GUARD (REMOVED IN LOGIC) ---
+    "PDT_MAX_TRADES": 999, # Set to high number effectively ignoring it
+    "FORCE_SHADOW_AT_PDT_LIMIT": False, 
     
     # --- SCOUT MODE ---
     "ALLOW_SCOUT_TRADE": True,         
@@ -74,7 +74,7 @@ CONFIG = {
     "COOLDOWN_PER_SYMBOL_MIN": 15,
     "ATR_PERIOD": 14,
     
-    # GOD MODE: Shorts enabled
+    # NO LIMITS: Shorts enabled
     "ALLOW_SHORTS": True if IS_PAPER else False, 
     
     # --- CALIBRATION REGIMES ---
@@ -99,16 +99,16 @@ CONFIG = {
     "HEARTBEAT_INTERVAL_MIN": 60,
     "NOTIFY_LEVEL": "INFO",
     
-    # GOD MODE: Fast Scan
+    # NO LIMITS: Fast Scan
     "SCAN_INTERVAL": 60 if IS_PAPER else 300
 }
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_8_5.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_8_6.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-GodMode")
+logger = logging.getLogger("Titan-NoLimits")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -173,7 +173,7 @@ class NotificationManager:
         await self.send(f"{emoji} Trade Closed: {symbol}", msg, priority="TRADE")
 
     async def send_heartbeat(self, status, equity, pnl_day, spy_vol, buying_power, pdt_count):
-        msg = f"**State:** {status}\n**Equity:** ${equity}\n**Day PnL:** {pnl_day}%\n**PDT Count:** {pdt_count} (Paper Mock)\n**SPY Vol:** {spy_vol}%"
+        msg = f"**State:** {status}\n**Equity:** ${equity}\n**Day PnL:** {pnl_day}%\n**PDT Count:** {pdt_count} (Disabled)\n**SPY Vol:** {spy_vol}%"
         await self.send("💓 System Heartbeat", msg, priority="INFO")
 
     async def send_halt(self, reason):
@@ -871,8 +871,9 @@ class TitanEngine:
 
         # UNCHAINED: PDT Guard Logic depends on Config
         pdt_limit_reached = False
-        if CONFIG["FORCE_SHADOW_AT_PDT_LIMIT"] and self.pdt_count >= CONFIG["PDT_MAX_TRADES"]:
-            pdt_limit_reached = True
+        # v8.8.6: REMOVED. PDT IS IGNORED IN THIS VERSION.
+        # if CONFIG["FORCE_SHADOW_AT_PDT_LIMIT"] and self.pdt_count >= CONFIG["PDT_MAX_TRADES"]:
+        #    pdt_limit_reached = True
 
         for p in picks:
             capped_reason = ""
@@ -1013,15 +1014,9 @@ class TitanEngine:
                 force_shadow = False
                 force_reason = ""
 
-                # PDT Override Logic
-                if pdt_limit_reached and not force_shadow:
-                    # In Paper Unchained: We ignore PDT limit, force_shadow stays False
-                    if CONFIG["FORCE_SHADOW_AT_PDT_LIMIT"]:
-                        force_shadow = True
-                        force_reason = "PDT_RISK_LIMIT (Max Trades Reached)"
-                        if conf >= CONFIG["LIVE_THRESHOLD"]:
-                            self.db.log_decision(symbol, conf, thesis, "SKIP", "SKIP (ALPHA_LOST_PDT)", ai_raw=raw_text)
-                            continue
+                # PDT Override Logic: REMOVED COMPLETELY IN v8.8.6
+                # if pdt_limit_reached and not force_shadow:
+                #    # ...
 
                 potential_gain_usd = qty * tp_dist
                 # UNCHAINED: Use Configurable Micro Edge
@@ -1200,7 +1195,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-GodMode v8.8.5 Ready. Paper Mode Unlocked. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
+    logger.info(f"Titan-NoLimits v8.8.6 Ready. Paper Mode Unlocked. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
