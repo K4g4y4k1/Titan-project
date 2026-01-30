@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.8.6 (NO LIMITS) ---
+# --- CONFIGURATION V8.8.8 (LIVE STABILIZED) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -25,56 +25,57 @@ ENV_MODE = os.getenv('ENV_MODE', 'PAPER')
 IS_PAPER = (ENV_MODE == 'PAPER')
 
 CONFIG = {
-    "VERSION": "8.8.6-NoLimits",
+    "VERSION": "8.8.8-Live-Stabilized",
     "LEARNING_EPOCH": 1,               
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     "ENV_MODE": ENV_MODE,
     "AI_MODEL": "deepseek/deepseek-v3.2",
     
-    # --- RISQUE & CAPITAL ---
-    "MAX_OPEN_POSITIONS": 5,           
-    "MAX_MACRO_POSITIONS": 1,          
+    # --- UNLOCKED CAPACITY ---
+    "MAX_OPEN_POSITIONS": 10 if IS_PAPER else 5,           
+    "MAX_MACRO_POSITIONS": 3 if IS_PAPER else 1,          
     "RISK_PCT_PER_TRADE": 2.0,       
-    "MAX_TOTAL_RISK_PCT": 6.0,
+    "MAX_TOTAL_RISK_PCT": 20.0 if IS_PAPER else 6.0,
     
     # --- SOLVENCY GUARDS ---
-    "MAX_CAPITAL_PER_TRADE_PCT": 25.0, 
-    "MAX_TOTAL_EXPOSURE_PCT": 60.0,    
+    "MAX_CAPITAL_PER_TRADE_PCT": 40.0 if IS_PAPER else 25.0, 
+    "MAX_TOTAL_EXPOSURE_PCT": 200.0 if IS_PAPER else 60.0, 
 
-    "LIVE_THRESHOLD": 76,
-    "MACRO_THRESHOLD": 85,             
+    # --- THRESHOLDS ---
+    "LIVE_THRESHOLD": 60 if IS_PAPER else 76,
+    "MACRO_THRESHOLD": 80 if IS_PAPER else 85,             
     
-    # NO LIMITS: Low thresholds for maximum activity
-    "MIN_TRADE_AMOUNT_USD": 50.0 if IS_PAPER else 150.0,
-    "MICRO_EDGE_MIN_USD": 0.05 if IS_PAPER else 0.20,
-    "MIN_SL_DISTANCE_USD": 0.05,        
+    # --- EXECUTION LIMITS ---
+    # Relaxed for paper to allow flow testing
+    "MIN_TRADE_AMOUNT_USD": 10.0 if IS_PAPER else 150.0,
+    "MICRO_EDGE_MIN_USD": 0.01 if IS_PAPER else 0.20,
+    "MIN_SL_DISTANCE_USD": 0.01,        
     
-    # --- KILL SWITCH 2-STAGES ---
-    "MIN_WINRATE_THRESHOLD": 62.0,     
-    "PNL_WARN_THRESHOLD": -1.5,        
-    "PNL_CRIT_THRESHOLD": -3.0,        
+    # --- KILL SWITCH ---
+    "MIN_WINRATE_THRESHOLD": 40.0 if IS_PAPER else 62.0,     
+    "PNL_WARN_THRESHOLD": -10.0 if IS_PAPER else -1.5,        
+    "PNL_CRIT_THRESHOLD": -20.0 if IS_PAPER else -3.0,        
     "WINRATE_LOOKBACK_TRADES": 20,     
-    "MARKET_OPEN_BLACKOUT_MIN": 15,    
+    "MARKET_OPEN_BLACKOUT_MIN": 0 if IS_PAPER else 15,
     
-    # --- PDT GUARD (REMOVED IN LOGIC) ---
-    "PDT_MAX_TRADES": 999, # Set to high number effectively ignoring it
+    # --- PDT GUARD (DISABLED IN CODE) ---
+    "PDT_MAX_TRADES": 999, 
     "FORCE_SHADOW_AT_PDT_LIMIT": False, 
     
     # --- SCOUT MODE ---
     "ALLOW_SCOUT_TRADE": True,         
-    "SCOUT_RISK_FACTOR": 0.5,          
+    "SCOUT_RISK_FACTOR": 1.0 if IS_PAPER else 0.5,
 
     # --- SHADOW PROMOTION ---
-    "SHADOW_PROMOTION_MIN_WINS": 2,    
-    "SHADOW_PROMOTION_HIGH_CONF": 80,  
+    "SHADOW_PROMOTION_MIN_WINS": 1,    
+    "SHADOW_PROMOTION_HIGH_CONF": 70,  
     "SHADOW_PROMOTION_WINDOW_HOURS": 24, 
 
-    "MARKET_STRESS_THRESHOLD": 1.8,
-    "COOLDOWN_PER_SYMBOL_MIN": 15,
+    "MARKET_STRESS_THRESHOLD": 5.0 if IS_PAPER else 1.8,
+    "COOLDOWN_PER_SYMBOL_MIN": 5 if IS_PAPER else 15,
     "ATR_PERIOD": 14,
     
-    # NO LIMITS: Shorts enabled
     "ALLOW_SHORTS": True if IS_PAPER else False, 
     
     # --- CALIBRATION REGIMES ---
@@ -93,22 +94,21 @@ CONFIG = {
     "ENABLE_ADAPTIVE_SHADOW": False,
     "VOLATILITY_HIGH_THRESHOLD": 0.005,
     "VOLATILITY_LOW_THRESHOLD": 0.001,
-    "MAX_DAILY_DRAWDOWN_PCT": -4.0,
-    "MAX_LOSSES_PER_SYMBOL": 2,
-    "MAX_SL_UPDATES_PER_TRADE": 20,
+    "MAX_DAILY_DRAWDOWN_PCT": -10.0 if IS_PAPER else -4.0,
+    "MAX_LOSSES_PER_SYMBOL": 5 if IS_PAPER else 2,
+    "MAX_SL_UPDATES_PER_TRADE": 50,
     "HEARTBEAT_INTERVAL_MIN": 60,
     "NOTIFY_LEVEL": "INFO",
     
-    # NO LIMITS: Fast Scan
     "SCAN_INTERVAL": 60 if IS_PAPER else 300
 }
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_8_6.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_8_8.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-NoLimits")
+logger = logging.getLogger("Titan-Stabilized")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -486,8 +486,9 @@ class TitanEngine:
     
     # --- SENTINEL MODULE ---
     async def verify_safety_protocol(self, symbol):
-        logger.info(f"🛡️ SENTINEL: Verifying safety for {symbol}...")
-        await asyncio.sleep(2) 
+        logger.info(f"🛡️ SENTINEL: Verifying safety for {symbol} (Grace Period: 15s)...")
+        # FIX: Increased grace period for Alpaca order creation
+        await asyncio.sleep(15) 
         try:
             position = None
             try: position = self.alpaca.get_position(symbol)
@@ -520,9 +521,9 @@ class TitanEngine:
         try:
             acc = self.alpaca.get_account()
             
-            # --- GOD MODE FIX: OBLITERATE PDT IN PAPER ---
+            # --- GOD MODE: OBLITERATE PDT IN PAPER ---
             if IS_PAPER:
-                self.pdt_count = 0 # Force 0 to kill all downstream guards
+                self.pdt_count = 0 
             else:
                 self.pdt_count = int(acc.daytrade_count)
 
@@ -531,7 +532,7 @@ class TitanEngine:
             start_eq = self.db.get_or_create_daily_stats(eq)
             pnl_pct = ((eq - start_eq) / start_eq * 100) if start_eq > 0 else 0.0
             
-            # Exposure Check
+            # Exposure Check (Relaxed in Paper)
             positions = self.alpaca.list_positions()
             real_exposure = sum([float(p.market_value) for p in positions])
             max_exposure_usd = eq * (CONFIG["MAX_TOTAL_EXPOSURE_PCT"] / 100.0)
@@ -842,7 +843,7 @@ class TitanEngine:
         if self.market_open_time:
              now = datetime.now(timezone.utc)
              if now < (self.market_open_time + timedelta(minutes=CONFIG["MARKET_OPEN_BLACKOUT_MIN"])):
-                 self.db.log_decision("SYSTEM", 0, "Market Open Blackout (First 15m)", "IDLE", "")
+                 self.db.log_decision("SYSTEM", 0, "Market Open Blackout", "IDLE", "")
                  return 
 
         ai_data = await self.fetch_ai_picks()
@@ -869,23 +870,16 @@ class TitanEngine:
         daily_live_count = self.db.get_daily_live_trade_count()
         is_scout_mode_eligible = CONFIG["ALLOW_SCOUT_TRADE"] and (daily_live_count == 0) and (len(current_open_trades) == 0)
 
-        # UNCHAINED: PDT Guard Logic depends on Config
-        pdt_limit_reached = False
-        # v8.8.6: REMOVED. PDT IS IGNORED IN THIS VERSION.
-        # if CONFIG["FORCE_SHADOW_AT_PDT_LIMIT"] and self.pdt_count >= CONFIG["PDT_MAX_TRADES"]:
-        #    pdt_limit_reached = True
-
         for p in picks:
             capped_reason = ""
             symbol = p.get('symbol', '').upper()
             side = p.get('side', 'BUY').upper()
             if side not in ['BUY', 'SELL']: side = 'BUY'
             
-            # GOD MODE FIX: OBLITERATE SHORT RESTRICTIONS IN PAPER
+            # TOTAL UNLOCK: NO SHORT RESTRICTION IN PAPER
             skip_tag = ""
             if side == 'SELL' and not CONFIG["ALLOW_SHORTS"]: skip_tag = "SKIP (ALPHA_LOST_SHORT)"
             
-            # Broker Check Bypass in Paper
             if not skip_tag and side == 'SELL' and not IS_PAPER:
                 try:
                     account = self.alpaca.get_account()
@@ -998,29 +992,43 @@ class TitanEngine:
                     capped_reason += " [SCOUT_RISK]"
                 
                 risk_amount_usd = current_equity * (base_risk_pct / 100.0)
-                raw_qty = math.floor(risk_amount_usd / sl_dist)
+                
+                # FIX: FRACTIONAL SHARES IN PAPER MODE
+                if IS_PAPER:
+                    raw_qty = risk_amount_usd / sl_dist # Float allow
+                else:
+                    raw_qty = math.floor(risk_amount_usd / sl_dist)
                 
                 current_bp_snapshot = self.status["equity"]["buying_power"]
                 if current_bp_snapshot <= 0: current_bp_snapshot = current_equity
                 
                 effective_bp = current_bp_snapshot - intra_loop_committed_cash
-                max_affordable_qty = math.floor((effective_bp * 0.95) / entry)
+                
+                if IS_PAPER:
+                     max_affordable_qty = (effective_bp * 0.95) / entry
+                else:
+                     max_affordable_qty = math.floor((effective_bp * 0.95) / entry)
 
                 max_capital_usd = current_equity * (CONFIG["MAX_CAPITAL_PER_TRADE_PCT"] / 100.0)
-                max_qty_by_cap = math.floor(max_capital_usd / entry)
+                
+                if IS_PAPER:
+                    max_qty_by_cap = max_capital_usd / entry
+                else:
+                    max_qty_by_cap = math.floor(max_capital_usd / entry)
                 
                 qty = min(raw_qty, max_affordable_qty, max_qty_by_cap)
+                
+                if IS_PAPER:
+                    qty = round(qty, 4)
+                else:
+                    qty = int(qty)
                 
                 force_shadow = False
                 force_reason = ""
 
-                # PDT Override Logic: REMOVED COMPLETELY IN v8.8.6
-                # if pdt_limit_reached and not force_shadow:
-                #    # ...
-
                 potential_gain_usd = qty * tp_dist
-                # UNCHAINED: Use Configurable Micro Edge
-                if potential_gain_usd < CONFIG["MICRO_EDGE_MIN_USD"] and not force_shadow:
+                # UNLOCKED: In Paper, we ignore micro-edge limits to prove flow
+                if potential_gain_usd < CONFIG["MICRO_EDGE_MIN_USD"] and not force_shadow and not IS_PAPER:
                     force_shadow = True
                     force_reason = f"MICRO_EDGE_TOO_SMALL (Pot. Gain ${round(potential_gain_usd, 2)} < ${CONFIG['MICRO_EDGE_MIN_USD']})"
 
@@ -1033,12 +1041,18 @@ class TitanEngine:
                          self.db.log_decision(symbol, conf, thesis, "SKIP", f"SOLVENCY_GUARD_ACTIVE (Global Exp {round(current_exposure/current_equity*100,1)}%)", ai_raw=raw_text)
                          continue
                      
-                     qty_limit_global = math.floor(remaining_exposure / entry)
+                     if IS_PAPER:
+                        qty_limit_global = remaining_exposure / entry
+                     else:
+                        qty_limit_global = math.floor(remaining_exposure / entry)
+                     
                      if qty > qty_limit_global:
                          qty = qty_limit_global
                          capped_reason += f" [GLOBAL_CAP_FIT]"
                      
-                     if qty < 1:
+                     # Check min qty logic
+                     min_qty_req = 0.0001 if IS_PAPER else 1
+                     if qty < min_qty_req:
                           self.db.log_decision(symbol, conf, thesis, "SKIP", f"SOLVENCY_GUARD_ACTIVE (Global Limit Reached)", ai_raw=raw_text)
                           continue
 
@@ -1048,18 +1062,19 @@ class TitanEngine:
                     elif qty == max_affordable_qty:
                         capped_reason += f" [Cash Drag]"
                 
-                # UNCHAINED: Use Configurable Min Trade Amount
+                # UNLOCKED: In Paper, we ignore trade amount limits
                 if (qty * entry) < CONFIG["MIN_TRADE_AMOUNT_USD"]:
-                    if not is_macro_mode and not is_scout_trade:
+                    if not is_macro_mode and not is_scout_trade and not IS_PAPER:
                         force_shadow = True
                         force_reason = f"DUST_RETAIL (<${CONFIG['MIN_TRADE_AMOUNT_USD']})"
                     else:
                         capped_reason += " [Micro-Pos Allowed]"
                 
-                if qty < 1 and not force_shadow:
+                min_qty_req = 0.0001 if IS_PAPER else 1
+                if qty < min_qty_req and not force_shadow:
                     reason_tag = "INSUFFICIENT_FUNDS"
                     if qty == max_qty_by_cap: reason_tag = "SKIP: SOLVENCY_GUARD_ACTIVE"
-                    debug_info = f"{reason_tag} | Price=${entry} Equity=${round(current_equity,0)}"
+                    debug_info = f"{reason_tag} | Price=${entry} Equity=${round(current_equity,0)} Qty={qty}"
                     self.db.log_decision(symbol, conf, thesis, "SKIP", debug_info, ai_raw=raw_text)
                     continue
 
@@ -1103,8 +1118,16 @@ class TitanEngine:
                         if side == "BUY" and (clean_tp <= entry or clean_sl >= entry):
                             raise APIError("Sanity Check Failed: Buy params invalid (TP<=Entry or SL>=Entry)")
                         
+                        # FIX: MARKETABLE LIMIT ORDER
+                        limit_price = entry
+                        if side == 'BUY': limit_price = entry * 1.01 
+                        else: limit_price = entry * 0.99
+                        clean_limit = sanitize_price(limit_price)
+
                         order = self.alpaca.submit_order(
-                            symbol=symbol, qty=qty, side=side.lower(), type='market', time_in_force='gtc', 
+                            symbol=symbol, qty=qty, side=side.lower(), 
+                            type='limit', limit_price=clean_limit, # CHANGED FROM MARKET TO LIMIT
+                            time_in_force='gtc', 
                             order_class='bracket', 
                             take_profit={'limit_price': clean_tp}, stop_loss={'stop_price': clean_sl}
                         )
@@ -1146,7 +1169,7 @@ class TitanEngine:
 
     async def main_loop(self):
         if IS_PAPER:
-            logger.warning("⚔️ PAPER GOD MODE ACTIVATED: PDT & Shorting Restrictions removed.")
+            logger.warning("⚔️ TITAN UNLOCKED: ALL SHADOW LIMITS REMOVED. LIVE EXECUTION FORCED.")
         
         while True:
             try:
@@ -1195,7 +1218,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-NoLimits v8.8.6 Ready. Paper Mode Unlocked. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
+    logger.info(f"Titan-Stabilized v8.8.8 Ready. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
