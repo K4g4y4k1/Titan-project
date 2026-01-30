@@ -14,18 +14,26 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.8.3 (RETAIL SURVIVAL) ---
+# --- CONFIGURATION V8.8.4 (PAPER UNCHAINED) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', "")
 TITAN_WEBHOOK_URL = os.getenv('TITAN_WEBHOOK_URL', "")
+ENV_MODE = os.getenv('ENV_MODE', 'PAPER')
+
+# LOGIC: DYNAMIC CONFIG BASED ON ENVIRONMENT
+# In PAPER: We remove chains to test mechanics and alpha.
+# In LIVE: We apply strict regulatory chains (PDT, Shorts restricted if cash acc, etc.)
+IS_PAPER = (ENV_MODE == 'PAPER')
 
 CONFIG = {
-    "VERSION": "8.8.3-Retail-Survival",
+    "VERSION": "8.8.4-Paper-Unchained",
     "LEARNING_EPOCH": 1,               
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
+    "ENV_MODE": ENV_MODE,
+    "AI_MODEL": "deepseek/deepseek-v3.2",
     
     # --- RISQUE & CAPITAL ---
     "MAX_OPEN_POSITIONS": 5,           
@@ -39,7 +47,10 @@ CONFIG = {
 
     "LIVE_THRESHOLD": 76,
     "MACRO_THRESHOLD": 85,             
-    "MIN_TRADE_AMOUNT_USD": 150.0,
+    
+    # UNCHAINED: Lower thresholds to allow execution flow in small acct
+    "MIN_TRADE_AMOUNT_USD": 50.0 if IS_PAPER else 150.0,
+    "MICRO_EDGE_MIN_USD": 0.05 if IS_PAPER else 0.20,
     "MIN_SL_DISTANCE_USD": 0.05,        
     
     # --- KILL SWITCH 2-STAGES ---
@@ -49,9 +60,10 @@ CONFIG = {
     "WINRATE_LOOKBACK_TRADES": 20,     
     "MARKET_OPEN_BLACKOUT_MIN": 15,    
     
-    # --- PDT GUARD (NEW v8.8.3) ---
-    "PDT_MAX_TRADES": 3,               # Max day trades allowed in 5 rolling days
-    "FORCE_SHADOW_AT_PDT_LIMIT": True, # Switch to SHADOW if PDT limit reached
+    # --- PDT GUARD (Conditional) ---
+    "PDT_MAX_TRADES": 3,
+    # UNCHAINED: Ignore PDT in Paper
+    "FORCE_SHADOW_AT_PDT_LIMIT": False if IS_PAPER else True, 
     
     # --- SCOUT MODE ---
     "ALLOW_SCOUT_TRADE": True,         
@@ -66,7 +78,8 @@ CONFIG = {
     "COOLDOWN_PER_SYMBOL_MIN": 15,
     "ATR_PERIOD": 14,
     
-    "ALLOW_SHORTS": False, # Still disabled for Retail
+    # UNCHAINED: Allow shorts in Paper to test symmetry
+    "ALLOW_SHORTS": True if IS_PAPER else False, 
     
     # --- CALIBRATION REGIMES ---
     "REGIME_CONFIG": {
@@ -89,8 +102,6 @@ CONFIG = {
     "MAX_SL_UPDATES_PER_TRADE": 20,
     "HEARTBEAT_INTERVAL_MIN": 60,
     "NOTIFY_LEVEL": "INFO",
-    "ENV_MODE": os.getenv('ENV_MODE', 'PAPER'),
-    "AI_MODEL": "deepseek/deepseek-v3.2",
     
     "SCAN_INTERVAL": 300 
 }
@@ -98,9 +109,9 @@ CONFIG = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_8_3.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_8_4.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-RetailSurvival")
+logger = logging.getLogger("Titan-Unchained")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -856,7 +867,7 @@ class TitanEngine:
         daily_live_count = self.db.get_daily_live_trade_count()
         is_scout_mode_eligible = CONFIG["ALLOW_SCOUT_TRADE"] and (daily_live_count == 0) and (len(current_open_trades) == 0)
 
-        # FIX #1 (v8.8.3): PDT GUARD
+        # UNCHAINED: PDT Guard Logic depends on Config
         pdt_limit_reached = False
         if CONFIG["FORCE_SHADOW_AT_PDT_LIMIT"] and self.pdt_count >= CONFIG["PDT_MAX_TRADES"]:
             pdt_limit_reached = True
@@ -867,7 +878,7 @@ class TitanEngine:
             side = p.get('side', 'BUY').upper()
             if side not in ['BUY', 'SELL']: side = 'BUY'
             
-            # FIX #2: Explicit SKIP for Shorts/PDT/Broker Limitations (Alpha Lost)
+            # UNCHAINED: ALLOW_SHORTS uses Config
             skip_tag = ""
             if side == 'SELL' and not CONFIG["ALLOW_SHORTS"]: skip_tag = "SKIP (ALPHA_LOST_SHORT)"
             
@@ -1000,19 +1011,21 @@ class TitanEngine:
                 force_shadow = False
                 force_reason = ""
 
-                # PDT Override
+                # PDT Override Logic
                 if pdt_limit_reached and not force_shadow:
-                    force_shadow = True
-                    force_reason = "PDT_RISK_LIMIT (Max Trades Reached)"
-                    # Log as Alpha Lost
-                    if conf >= CONFIG["LIVE_THRESHOLD"]:
-                        self.db.log_decision(symbol, conf, thesis, "SKIP", "SKIP (ALPHA_LOST_PDT)", ai_raw=raw_text)
-                        continue
+                    # In Paper Unchained: We ignore PDT limit, force_shadow stays False
+                    if CONFIG["FORCE_SHADOW_AT_PDT_LIMIT"]:
+                        force_shadow = True
+                        force_reason = "PDT_RISK_LIMIT (Max Trades Reached)"
+                        if conf >= CONFIG["LIVE_THRESHOLD"]:
+                            self.db.log_decision(symbol, conf, thesis, "SKIP", "SKIP (ALPHA_LOST_PDT)", ai_raw=raw_text)
+                            continue
 
                 potential_gain_usd = qty * tp_dist
-                if potential_gain_usd < 0.20 and not force_shadow:
+                # UNCHAINED: Use Configurable Micro Edge
+                if potential_gain_usd < CONFIG["MICRO_EDGE_MIN_USD"] and not force_shadow:
                     force_shadow = True
-                    force_reason = f"MICRO_EDGE_TOO_SMALL (Pot. Gain ${round(potential_gain_usd, 2)} < $0.20)"
+                    force_reason = f"MICRO_EDGE_TOO_SMALL (Pot. Gain ${round(potential_gain_usd, 2)} < ${CONFIG['MICRO_EDGE_MIN_USD']})"
 
                 new_trade_exposure = qty * entry
                 max_total_exposure = current_equity * (CONFIG["MAX_TOTAL_EXPOSURE_PCT"] / 100.0)
@@ -1038,6 +1051,7 @@ class TitanEngine:
                     elif qty == max_affordable_qty:
                         capped_reason += f" [Cash Drag]"
                 
+                # UNCHAINED: Use Configurable Min Trade Amount
                 if (qty * entry) < CONFIG["MIN_TRADE_AMOUNT_USD"]:
                     if not is_macro_mode and not is_scout_trade:
                         force_shadow = True
@@ -1086,11 +1100,9 @@ class TitanEngine:
                     dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", log_msg, ai_raw=raw_text)
                     
                     try:
-                        # FIX #3: Strict Sanitization
                         clean_tp = sanitize_price(tp)
                         clean_sl = sanitize_price(sl)
                         
-                        # Extra Safety Check for OCO validity
                         if side == "BUY" and (clean_tp <= entry or clean_sl >= entry):
                             raise APIError("Sanity Check Failed: Buy params invalid (TP<=Entry or SL>=Entry)")
                         
@@ -1183,7 +1195,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-RetailSurvival v8.8.3 Ready. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
+    logger.info(f"Titan-Unchained v8.8.4 Ready. Paper Mode Unlocked. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
