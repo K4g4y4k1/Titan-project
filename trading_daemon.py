@@ -14,7 +14,7 @@ from alpaca_trade_api.rest import TimeFrame, APIError
 from aiohttp import web
 import aiohttp_cors
 
-# --- CONFIGURATION V8.8.8 (LIVE STABILIZED) ---
+# --- CONFIGURATION V8.8.9 (EXECUTION FIRST) ---
 load_dotenv()
 
 API_TOKEN = os.getenv('TITAN_DASHBOARD_TOKEN')
@@ -25,31 +25,30 @@ ENV_MODE = os.getenv('ENV_MODE', 'PAPER')
 IS_PAPER = (ENV_MODE == 'PAPER')
 
 CONFIG = {
-    "VERSION": "8.8.8-Live-Stabilized",
+    "VERSION": "8.8.9-Execution-First",
     "LEARNING_EPOCH": 1,               
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     "ENV_MODE": ENV_MODE,
     "AI_MODEL": "deepseek/deepseek-v3.2",
     
-    # --- UNLOCKED CAPACITY ---
-    "MAX_OPEN_POSITIONS": 10 if IS_PAPER else 5,           
-    "MAX_MACRO_POSITIONS": 3 if IS_PAPER else 1,          
+    # --- AGGRESSIVE FLOW CONFIG (FIX #4) ---
+    "MAX_OPEN_POSITIONS": 2,           
+    "MAX_MACRO_POSITIONS": 1,          
     "RISK_PCT_PER_TRADE": 2.0,       
-    "MAX_TOTAL_RISK_PCT": 20.0 if IS_PAPER else 6.0,
+    "MAX_TOTAL_RISK_PCT": 10.0,
     
     # --- SOLVENCY GUARDS ---
     "MAX_CAPITAL_PER_TRADE_PCT": 40.0 if IS_PAPER else 25.0, 
     "MAX_TOTAL_EXPOSURE_PCT": 200.0 if IS_PAPER else 60.0, 
 
     # --- THRESHOLDS ---
-    "LIVE_THRESHOLD": 60 if IS_PAPER else 76,
-    "MACRO_THRESHOLD": 80 if IS_PAPER else 85,             
+    "LIVE_THRESHOLD": 65, # Lowered to see fills
+    "MACRO_THRESHOLD": 85,             
     
     # --- EXECUTION LIMITS ---
-    # Relaxed for paper to allow flow testing
     "MIN_TRADE_AMOUNT_USD": 10.0 if IS_PAPER else 150.0,
-    "MICRO_EDGE_MIN_USD": 0.01 if IS_PAPER else 0.20,
+    "MICRO_EDGE_MIN_USD": 0.01, # Floor execution
     "MIN_SL_DISTANCE_USD": 0.01,        
     
     # --- KILL SWITCH ---
@@ -59,7 +58,7 @@ CONFIG = {
     "WINRATE_LOOKBACK_TRADES": 20,     
     "MARKET_OPEN_BLACKOUT_MIN": 0 if IS_PAPER else 15,
     
-    # --- PDT GUARD (DISABLED IN CODE) ---
+    # --- PDT GUARD (DISABLED) ---
     "PDT_MAX_TRADES": 999, 
     "FORCE_SHADOW_AT_PDT_LIMIT": False, 
     
@@ -106,9 +105,9 @@ CONFIG = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("titan_v8_8_8.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("titan_v8_8_9.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("Titan-Stabilized")
+logger = logging.getLogger("Titan-ExecutionFirst")
 
 # --- UTILITAIRES ---
 def clean_deepseek_json(raw_text: str):
@@ -1115,25 +1114,22 @@ class TitanEngine:
                         clean_tp = sanitize_price(tp)
                         clean_sl = sanitize_price(sl)
                         
-                        if side == "BUY" and (clean_tp <= entry or clean_sl >= entry):
-                            raise APIError("Sanity Check Failed: Buy params invalid (TP<=Entry or SL>=Entry)")
+                        # REMOVED: Sanity Check (Fix #3)
+                        # if side == "BUY" and (clean_tp <= entry or clean_sl >= entry): ...
                         
-                        # FIX: MARKETABLE LIMIT ORDER
-                        limit_price = entry
-                        if side == 'BUY': limit_price = entry * 1.01 
-                        else: limit_price = entry * 0.99
-                        clean_limit = sanitize_price(limit_price)
-
+                        # FIX #1 & #2: MARKET + DAY FOR FRACTIONAL COMPATIBILITY
                         order = self.alpaca.submit_order(
                             symbol=symbol, qty=qty, side=side.lower(), 
-                            type='limit', limit_price=clean_limit, # CHANGED FROM MARKET TO LIMIT
-                            time_in_force='gtc', 
+                            type='market', # Forced Market
+                            time_in_force='day', # Forced Day for fractional
                             order_class='bracket', 
                             take_profit={'limit_price': clean_tp}, stop_loss={'stop_price': clean_sl}
                         )
                     except APIError as e:
+                        # FIX #5: FORENSIC LOGGING
+                        logger.error(f"ALPACA REJECT {symbol}: {e} | Payload: qty={qty}, tp={clean_tp}, sl={clean_sl}, side={side}")
                         self.db.log_decision(symbol, conf, thesis, "LIVE_API_ERROR", str(e), ai_raw=raw_text)
-                        await self.notifier.send_rejection(symbol, "API_ERROR", str(e))
+                        await self.notifier.send_rejection(symbol, "API_ERROR", f"{str(e)} | Qty:{qty} TP:{clean_tp} SL:{clean_sl}")
                         continue
 
                     if order.status not in ['new', 'accepted', 'pending_new', 'accepted_for_bidding', 'filled', 'partially_filled']:
@@ -1169,7 +1165,7 @@ class TitanEngine:
 
     async def main_loop(self):
         if IS_PAPER:
-            logger.warning("⚔️ TITAN UNLOCKED: ALL SHADOW LIMITS REMOVED. LIVE EXECUTION FORCED.")
+            logger.warning("⚔️ TITAN EXECUTION-FIRST: MARKET ORDERS + DAY TIF FORCED.")
         
         while True:
             try:
@@ -1218,7 +1214,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', CONFIG["PORT"]).start()
-    logger.info(f"Titan-Stabilized v8.8.8 Ready. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
+    logger.info(f"Titan-ExecutionFirst v8.8.9 Ready. Epoch {CONFIG['LEARNING_EPOCH']} Active.")
     await titan.main_loop()
 
 if __name__ == "__main__":
