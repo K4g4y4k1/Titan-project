@@ -30,7 +30,7 @@ CONFIG = {
     "PORT": 8080,
     "DB_PATH": "titan_v8_recon.db",
     "ENV_MODE": ENV_MODE,
-    "AI_MODEL": "deepseek/deepseek-v3.2",
+    "AI_MODEL": "google/gemini-3.1-flash-lite-preview",
     
     # --- AGGRESSIVE FLOW CONFIG (FIX #4) ---
     "MAX_OPEN_POSITIONS": 2,           
@@ -59,8 +59,8 @@ CONFIG = {
     "MARKET_OPEN_BLACKOUT_MIN": 0 if IS_PAPER else 15,
     
     # --- PDT GUARD (DISABLED) ---
-    "PDT_MAX_TRADES": 999, 
-    "FORCE_SHADOW_AT_PDT_LIMIT": False, 
+    "PDT_MAX_TRADES": 3, 
+    "FORCE_SHADOW_AT_PDT_LIMIT": True, 
     
     # --- SCOUT MODE ---
     "ALLOW_SCOUT_TRADE": True,         
@@ -99,7 +99,8 @@ CONFIG = {
     "HEARTBEAT_INTERVAL_MIN": 60,
     "NOTIFY_LEVEL": "INFO",
     
-    "SCAN_INTERVAL": 60 if IS_PAPER else 300
+    "SCAN_INTERVAL": 60 if IS_PAPER else 300,
+    "MIN_BRACKET_DIST_PCT": 0.0015 # 0.15% min distance for Alpaca safety
 }
 
 logging.basicConfig(
@@ -110,7 +111,7 @@ logging.basicConfig(
 logger = logging.getLogger("Titan-ExecutionFirst")
 
 # --- UTILITAIRES ---
-def clean_deepseek_json(raw_text: str):
+def clean_gemini_json(raw_text: str):
     if not raw_text: return None
     text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL)
     text = re.sub(r"```json", "", text, flags=re.IGNORECASE)
@@ -520,11 +521,8 @@ class TitanEngine:
         try:
             acc = self.alpaca.get_account()
             
-            # --- GOD MODE: OBLITERATE PDT IN PAPER ---
-            if IS_PAPER:
-                self.pdt_count = 0 
-            else:
-                self.pdt_count = int(acc.daytrade_count)
+            # --- PDT GUARD: BROKER-LEVEL SYNC ---
+            self.pdt_count = int(acc.daytrade_count)
 
             eq = float(acc.equity)
             bp = float(acc.buying_power)
@@ -823,7 +821,7 @@ class TitanEngine:
                 timeout=30) as r:
                 resp_json = await r.json()
                 raw_content = resp_json['choices'][0]['message']['content'] if 'choices' in resp_json else str(resp_json)
-                parsed = clean_deepseek_json(raw_content)
+                parsed = clean_gemini_json(raw_content)
                 if parsed and "picks" in parsed: return {"picks": parsed["picks"], "raw": raw_content, "error": None}
                 return {"picks": [], "raw": raw_content, "error": "PARSE_ERROR"}
         except Exception as e:
@@ -875,9 +873,22 @@ class TitanEngine:
             side = p.get('side', 'BUY').upper()
             if side not in ['BUY', 'SELL']: side = 'BUY'
             
-            # TOTAL UNLOCK: NO SHORT RESTRICTION IN PAPER
+            # --- ASSET VERIFICATION (CRITICAL FIX) ---
+            try:
+                asset = self.alpaca.get_asset(symbol)
+                if not asset.tradable:
+                    self.db.log_decision(symbol, 0, p.get('reason',''), "SKIP", "NOT_TRADABLE", ai_raw=raw_text)
+                    continue
+                if side == 'SELL' and not asset.shortable:
+                    self.db.log_decision(symbol, 0, p.get('reason',''), "SKIP", "NOT_SHORTABLE", ai_raw=raw_text)
+                    continue
+            except Exception as e:
+                self.db.log_decision(symbol, 0, p.get('reason',''), "SKIP", f"ASSET_ERROR ({str(e)})", ai_raw=raw_text)
+                continue
+
+            # TOTAL UNLOCK: NO SHORT RESTRICTION IN PAPER IF ASSET ALLOWS
             skip_tag = ""
-            if side == 'SELL' and not CONFIG["ALLOW_SHORTS"]: skip_tag = "SKIP (ALPHA_LOST_SHORT)"
+            if side == 'SELL' and not CONFIG["ALLOW_SHORTS"] and not IS_PAPER: skip_tag = "SKIP (ALPHA_LOST_SHORT)"
             
             if not skip_tag and side == 'SELL' and not IS_PAPER:
                 try:
@@ -944,40 +955,32 @@ class TitanEngine:
                 tp_mult = regime_settings["TP_MULT"]
                 sl_mult = regime_settings["SL_MULT"]
 
-                sl_dist = atr * sl_mult
-                tp_dist = atr * tp_mult
+                # --- PRECISION FIX: BUFFERING TO AVOID REJECTIONS ---
+                min_dist = entry * CONFIG["MIN_BRACKET_DIST_PCT"]
+                sl_dist = max(atr * sl_mult, min_dist)
+                tp_dist = max(atr * tp_mult, min_dist)
 
-                MIN_TICK = 0.01
-                
                 if side == "BUY":
-                    tp = max(round(entry + tp_dist, 2), round(entry + MIN_TICK, 2))
-                    sl = min(round(entry - sl_dist, 2), round(entry - MIN_TICK, 2))
-                    sl_dist = round(entry - sl, 2)
+                    tp = round(entry + tp_dist, 2)
+                    sl = round(entry - sl_dist, 2)
                 else: # SELL
-                    tp = min(round(entry - tp_dist, 2), round(entry - MIN_TICK, 2))
-                    sl = max(round(entry + sl_dist, 2), round(entry + MIN_TICK, 2))
-                    sl_dist = round(sl - entry, 2)
+                    tp = round(entry - tp_dist, 2)
+                    sl = round(entry + sl_dist, 2)
+
+                # Final sanity nudge to ensure broker acceptance (>0.01 from base)
+                if side == "BUY":
+                    if tp <= (entry + 0.02): tp = round(entry + 0.05, 2)
+                    if sl >= (entry - 0.02): sl = round(entry - 0.05, 2)
+                else:
+                    if tp >= (entry - 0.02): tp = round(entry - 0.05, 2)
+                    if sl <= (entry + 0.02): sl = round(entry + 0.05, 2)
 
                 if side == "BUY" and (tp <= entry or sl >= entry):
-                        self.db.log_decision(symbol, conf, thesis, "SKIP", f"MATH_ERROR (TP={tp} SL={sl} Entry={entry})", ai_raw=raw_text)
+                        self.db.log_decision(symbol, conf, thesis, "SKIP", f"MATH_ERROR (BUY TP={tp} SL={sl} E={entry})", ai_raw=raw_text)
                         continue
                 if side == "SELL" and (tp >= entry or sl <= entry):
-                        self.db.log_decision(symbol, conf, thesis, "SKIP", f"MATH_ERROR (TP={tp} SL={sl} Entry={entry})", ai_raw=raw_text)
+                        self.db.log_decision(symbol, conf, thesis, "SKIP", f"MATH_ERROR (SELL TP={tp} SL={sl} E={entry})", ai_raw=raw_text)
                         continue
-                
-                if not is_macro_mode:
-                    if sl_dist < CONFIG["MIN_SL_DISTANCE_USD"]:
-                        if regime == "RANGE" and conf >= CONFIG["LIVE_THRESHOLD"]:
-                             sl_dist = CONFIG["MIN_SL_DISTANCE_USD"]
-                             if side == "BUY": sl = round(entry - sl_dist, 2)
-                             else: sl = round(entry + sl_dist, 2)
-                             capped_reason += " [SL_FLOOR_APPLIED]"
-                        else:
-                            debug_info = f"SL_TOO_TIGHT | ATR={round(atr, 4)} SL_Dist={round(sl_dist, 4)} Min=${CONFIG['MIN_SL_DISTANCE_USD']} Regime={regime}"
-                            self.db.log_decision(symbol, conf, thesis, "SKIP", debug_info, ai_raw=raw_text)
-                            continue
-                
-                if sl_dist < (entry * 0.001): continue
                 
                 current_equity = self.status["equity"]["current"]
                 if current_equity <= 0: current_equity = 1000.0
@@ -992,44 +995,35 @@ class TitanEngine:
                 
                 risk_amount_usd = current_equity * (base_risk_pct / 100.0)
                 
-                # FIX: FRACTIONAL SHARES IN PAPER MODE
-                if IS_PAPER:
-                    raw_qty = risk_amount_usd / sl_dist # Float allow
-                else:
-                    raw_qty = math.floor(risk_amount_usd / sl_dist)
+                # --- FRACTIONAL VS BRACKET FIX ---
+                # Alpaca does NOT support bracket orders for fractional quantities.
+                # We force integer for reliability in ExecutionFirst mode.
+                raw_qty = math.floor(risk_amount_usd / abs(entry - sl))
                 
                 current_bp_snapshot = self.status["equity"]["buying_power"]
                 if current_bp_snapshot <= 0: current_bp_snapshot = current_equity
                 
                 effective_bp = current_bp_snapshot - intra_loop_committed_cash
-                
-                if IS_PAPER:
-                     max_affordable_qty = (effective_bp * 0.95) / entry
-                else:
-                     max_affordable_qty = math.floor((effective_bp * 0.95) / entry)
+                max_affordable_qty = math.floor((effective_bp * 0.92) / entry) # Buffering BP
 
                 max_capital_usd = current_equity * (CONFIG["MAX_CAPITAL_PER_TRADE_PCT"] / 100.0)
+                max_qty_by_cap = math.floor(max_capital_usd / entry)
                 
-                if IS_PAPER:
-                    max_qty_by_cap = max_capital_usd / entry
-                else:
-                    max_qty_by_cap = math.floor(max_capital_usd / entry)
-                
-                qty = min(raw_qty, max_affordable_qty, max_qty_by_cap)
-                
-                if IS_PAPER:
-                    qty = round(qty, 4)
-                else:
-                    qty = int(qty)
+                qty = int(min(raw_qty, max_affordable_qty, max_qty_by_cap))
                 
                 force_shadow = False
                 force_reason = ""
 
-                potential_gain_usd = qty * tp_dist
-                # UNLOCKED: In Paper, we ignore micro-edge limits to prove flow
+                # --- PDT PROTECTION FIX ---
+                if self.pdt_count >= CONFIG["PDT_MAX_TRADES"] and current_equity < 25000:
+                    if CONFIG["FORCE_SHADOW_AT_PDT_LIMIT"]:
+                        force_shadow = True
+                        force_reason = f"PDT_PROTECT (Count:{self.pdt_count})"
+
+                potential_gain_usd = qty * abs(tp - entry)
                 if potential_gain_usd < CONFIG["MICRO_EDGE_MIN_USD"] and not force_shadow and not IS_PAPER:
                     force_shadow = True
-                    force_reason = f"MICRO_EDGE_TOO_SMALL (Pot. Gain ${round(potential_gain_usd, 2)} < ${CONFIG['MICRO_EDGE_MIN_USD']})"
+                    force_reason = f"MICRO_EDGE_TOO_SMALL (${round(potential_gain_usd, 2)})"
 
                 new_trade_exposure = qty * entry
                 max_total_exposure = current_equity * (CONFIG["MAX_TOTAL_EXPOSURE_PCT"] / 100.0)
@@ -1037,61 +1031,33 @@ class TitanEngine:
                 if (current_exposure + new_trade_exposure) > max_total_exposure:
                      remaining_exposure = max_total_exposure - current_exposure
                      if remaining_exposure <= 0:
-                         self.db.log_decision(symbol, conf, thesis, "SKIP", f"SOLVENCY_GUARD_ACTIVE (Global Exp {round(current_exposure/current_equity*100,1)}%)", ai_raw=raw_text)
+                         self.db.log_decision(symbol, conf, thesis, "SKIP", f"SOLVENCY_GUARD_ACTIVE (Exposure Cap)", ai_raw=raw_text)
                          continue
                      
-                     if IS_PAPER:
-                        qty_limit_global = remaining_exposure / entry
-                     else:
-                        qty_limit_global = math.floor(remaining_exposure / entry)
-                     
+                     qty_limit_global = math.floor(remaining_exposure / entry)
                      if qty > qty_limit_global:
-                         qty = qty_limit_global
+                         qty = int(qty_limit_global)
                          capped_reason += f" [GLOBAL_CAP_FIT]"
-                     
-                     # Check min qty logic
-                     min_qty_req = 0.0001 if IS_PAPER else 1
-                     if qty < min_qty_req:
-                          self.db.log_decision(symbol, conf, thesis, "SKIP", f"SOLVENCY_GUARD_ACTIVE (Global Limit Reached)", ai_raw=raw_text)
-                          continue
 
-                if qty < raw_qty:
-                    if qty == max_qty_by_cap:
-                        capped_reason += f" [SINGLE_CAP: {CONFIG['MAX_CAPITAL_PER_TRADE_PCT']}%]"
-                    elif qty == max_affordable_qty:
-                        capped_reason += f" [Cash Drag]"
-                
-                # UNLOCKED: In Paper, we ignore trade amount limits
-                if (qty * entry) < CONFIG["MIN_TRADE_AMOUNT_USD"]:
-                    if not is_macro_mode and not is_scout_trade and not IS_PAPER:
-                        force_shadow = True
-                        force_reason = f"DUST_RETAIL (<${CONFIG['MIN_TRADE_AMOUNT_USD']})"
-                    else:
-                        capped_reason += " [Micro-Pos Allowed]"
-                
-                min_qty_req = 0.0001 if IS_PAPER else 1
-                if qty < min_qty_req and not force_shadow:
-                    reason_tag = "INSUFFICIENT_FUNDS"
-                    if qty == max_qty_by_cap: reason_tag = "SKIP: SOLVENCY_GUARD_ACTIVE"
-                    debug_info = f"{reason_tag} | Price=${entry} Equity=${round(current_equity,0)} Qty={qty}"
-                    self.db.log_decision(symbol, conf, thesis, "SKIP", debug_info, ai_raw=raw_text)
+                if qty < 1 and not force_shadow:
+                    self.db.log_decision(symbol, conf, thesis, "SKIP", f"INSUFFICIENT_FUNDS (Qty < 1)", ai_raw=raw_text)
                     continue
 
-                new_trade_risk = qty * sl_dist
+                new_trade_risk = qty * abs(entry - sl)
                 potential_total_risk = current_open_risk + intra_loop_committed_risk + new_trade_risk
                 max_allowed_risk = current_equity * (CONFIG["MAX_TOTAL_RISK_PCT"] / 100.0)
                 
                 if potential_total_risk > max_allowed_risk:
                     force_shadow = True
-                    force_reason = f"RISK_CAP_BREACH (Total Risk > {CONFIG['MAX_TOTAL_RISK_PCT']}%)"
+                    force_reason = f"RISK_CAP_BREACH"
 
                 if is_macro_mode and current_macro_count >= CONFIG["MAX_MACRO_POSITIONS"]:
                     force_shadow = True
-                    force_reason = "MACRO_SLOT_FULL (Sniper Mode)"
+                    force_reason = "MACRO_SLOT_FULL"
                     
                 if self.status["health"] == "DEGRADED" and (len(current_open_trades) >= 1):
                     force_shadow = True
-                    force_reason = "DEGRADED_MODE_CAP (Max 1 Pos)"
+                    force_reason = "DEGRADED_MODE_CAP"
 
                 force_live_trigger = (is_shadow_promoted or (conf >= CONFIG["MACRO_THRESHOLD"]) or is_scout_trade)
                 
@@ -1104,8 +1070,8 @@ class TitanEngine:
                 if self.status["safety"]["market_stress"]: can_live = False
 
                 log_msg = f"Side:{side} Mode:{mode_tag} ATR:{round(atr,2)} {capped_reason}"
-                if is_shadow_promoted: log_msg += " [SHADOW_PROMOTED]"
-                if is_scout_trade: log_msg += " [SCOUT_TRADE]"
+                if is_shadow_promoted: log_msg += " [PROMOTED]"
+                if is_scout_trade: log_msg += " [SCOUT]"
 
                 if can_live:
                     dec_id = self.db.log_decision(symbol, conf, thesis, "LIVE", log_msg, ai_raw=raw_text)
